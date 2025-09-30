@@ -18,7 +18,7 @@
 
 ### 1. 安装
 
-将 `custom_commands_plugin` 文件夹放入麦麦主程序的 `plugins` 目录下，然后重启主程序即可完成插件的注册。
+下载 `custom_commands_plugin` 文件夹放入麦麦主程序的 `plugins` 目录下，然后重启主程序即可完成插件的注册。
 
 ### 2. 配置
 
