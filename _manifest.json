@@ -5,15 +5,15 @@
     "description": "一个可以通过自定义的命令来触发 Bot 自动回复特定内容的插件",
     "author": {
         "name": "TaiYang",
-        "url": ""
+        "url": "https://github.com/TAIY2020"
     },
     "license": "MIT",
 
     "host_application": {
         "min_version": "0.10.2"
     },
-    "homepage_url": "",
-    "repository_url": "",
+    "homepage_url": "https://github.com/TAIY2020/custom_commands_plugin",
+    "repository_url": "https://github.com/TAIY2020/custom_commands_plugin",
     "keywords": ["自定义命令", "群聊"],
     "categories": ["Utility Tools", "Content Generation", "Other"],
 
