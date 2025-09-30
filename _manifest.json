@@ -1,0 +1,26 @@
+{
+    "manifest_version": 1,
+    "name": "Custom Commands 插件 (custom_commands_plugin)",
+    "version": "1.0.0",
+    "description": "一个可以通过自定义的命令来触发 Bot 自动回复特定内容的插件",
+    "author": {
+        "name": "TaiYang",
+        "url": ""
+    },
+    "license": "MIT",
+
+    "host_application": {
+        "min_version": "0.10.2"
+    },
+    "homepage_url": "",
+    "repository_url": "",
+    "keywords": ["自定义命令", "群聊"],
+    "categories": ["Utility Tools", "Content Generation", "Other"],
+
+    "default_locale": "zh-CN",
+    "locales_path": "_locales",
+
+    "plugin_info": {
+        "is_built_in": false
+    }
+}
