@@ -1,8 +1,8 @@
 {
     "manifest_version": 1,
     "name": "Custom Commands 插件 (custom_commands_plugin)",
-    "version": "1.0.0",
-    "description": "一个可以通过自定义的命令来触发 Bot 自动回复特定内容的插件",
+    "version": "1.5.2",
+    "description": "一个允许你通过聊天命令动态添加、删除、列出和触发自定义回复的强大插件",
     "author": {
         "name": "TaiYang",
         "url": "https://github.com/TAIY2020"
@@ -14,7 +14,7 @@
     },
     "homepage_url": "https://github.com/TAIY2020/custom_commands_plugin",
     "repository_url": "https://github.com/TAIY2020/custom_commands_plugin",
-    "keywords": ["自定义命令", "群聊"],
+    "keywords": ["custom command", "dynamic reply", "自定义命令", "自动回复"],
     "categories": ["Utility Tools", "Content Generation", "Other"],
 
     "default_locale": "zh-CN",
