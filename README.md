@@ -136,7 +136,7 @@ image_directory = "plugins/custom_commands_plugin/images"
 
 #### 命令示例
 
->![命令示例](./示例.jpg)
+>![命令示例](https://s21.ax1x.com/2025/11/05/pZS7tXj.jpg)
 
 ---
 
