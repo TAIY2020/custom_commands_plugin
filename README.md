@@ -1,4 +1,4 @@
-# CustomCommands 插件
+# 自定义命令插件 (CustomCommandsPlugin)
 
 **一个允许你通过聊天命令动态添加、删除、列出和触发自定义回复的强大插件。**
 
