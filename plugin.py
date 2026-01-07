@@ -404,7 +404,7 @@ class CustomCommandsPlugin(BasePlugin):
     config_schema: dict = {
         "plugin": {
             "name": ConfigField(type=str, default="custom_commands_plugin", description="插件名称", disabled=True),
-            "version": ConfigField(type=str, default="1.6.1", description="插件版本", disabled=True),
+            "version": ConfigField(type=str, default="1.6.2", description="插件版本", disabled=True),
             "enabled": ConfigField(type=bool, default=True, description="是否启用插件", label="启用插件"),
         },
         "settings": {

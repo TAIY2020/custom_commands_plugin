@@ -1,7 +1,7 @@
 {
     "manifest_version": 1,
     "name": "自定义命令插件 (CustomCommandsPlugin)",
-    "version": "1.6.0",
+    "version": "1.6.2",
     "description": "一个允许你通过聊天命令动态添加、删除、列出和触发自定义回复的强大插件",
     "author": {
         "name": "TaiYang",
