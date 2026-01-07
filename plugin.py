@@ -403,27 +403,44 @@ class CustomCommandsPlugin(BasePlugin):
 
     config_schema: dict = {
         "plugin": {
-            "name": ConfigField(type=str, default="custom_commands_plugin", description="插件名称"),
-            "version": ConfigField(type=str, default="1.6.0", description="插件版本"),
-            "enabled": ConfigField(type=bool, default=True, description="是否启用插件"),
+            "name": ConfigField(type=str, default="custom_commands_plugin", description="插件名称", disabled=True),
+            "version": ConfigField(type=str, default="1.6.1", description="插件版本", disabled=True),
+            "enabled": ConfigField(type=bool, default=True, description="是否启用插件", label="启用插件"),
         },
         "settings": {
-            "command_prefix": ConfigField(type=str, default=".", description="所有自定义命令的前缀"),
-            "admin_user_ids": ConfigField(type=list, default=[], description="拥有添加/删除命令权限的用户ID列表 (QQ号)。留空 [] 表示任何人都没有权限。"),
+            "command_prefix": ConfigField(
+                type=str,
+                default=".",
+                description="所有自定义命令的前缀",
+                label="命令前缀",
+                input_type="text"
+            ),
+            "admin_user_ids": ConfigField(
+                type=list,
+                default=[],
+                description="拥有添加/删除命令权限的用户ID列表 (QQ号)。留空 [] 表示任何人都没有权限。",
+                label="管理员列表",
+                input_type="list"
+            ),
             "image_directory": ConfigField(
                 type=str,
                 default="plugins/custom_commands_plugin/images",
-                description="存放自定义回复图片的目录路径（相对于主程序根目录）"
+                description="存放自定义回复图片的目录路径（相对于主程序根目录）",
+                label="图片目录",
+                input_type="text"
             ),
             "enable_group_isolation": ConfigField(
                 type=bool,
                 default=False,
-                description="是否开启群组隔离默认模式。若开启，未配置映射的群组将使用各自独立的命令库。"
+                description="是否开启群组隔离默认模式。若开启，未配置映射的群组将使用各自独立的命令库。",
+                label="启用群组隔离",
+                input_type="checkbox"
             ),
             "group_scopes": ConfigField(
                 type=dict,
                 default={ },
                 description="群组作用域映射。键为群号(group_id)，值为自定义的作用域名称。作用域名称相同的群组将共享同一套命令。",
+                label="群组作用域映射",
                 example='{ "123456" = "gaming_group", "654321" = "gaming_group" }'
             )
         },
