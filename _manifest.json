@@ -1,26 +1,33 @@
 {
-    "manifest_version": 1,
-    "name": "自定义命令插件 (CustomCommandsPlugin)",
-    "version": "1.6.2",
-    "description": "一个允许你通过聊天命令动态添加、删除、列出和触发自定义回复的强大插件",
-    "author": {
-        "name": "TaiYang",
-        "url": "https://github.com/TAIY2020"
-    },
-    "license": "MIT",
-
-    "host_application": {
-        "min_version": "0.10.2"
-    },
-    "homepage_url": "https://github.com/TAIY2020/custom_commands_plugin",
-    "repository_url": "https://github.com/TAIY2020/custom_commands_plugin",
-    "keywords": ["custom command", "dynamic reply", "自定义命令", "自动回复"],
-    "categories": ["Utility Tools", "Content Generation", "Other"],
-
-    "default_locale": "zh-CN",
-    "locales_path": "_locales",
-
-    "plugin_info": {
-        "is_built_in": false
-    }
+  "manifest_version": 1,
+  "name": "自定义命令插件 (CustomCommandsPlugin)",
+  "version": "1.6.2",
+  "description": "一个允许你通过聊天命令动态添加、删除、列出和触发自定义回复的强大插件",
+  "author": {
+    "name": "TaiYang",
+    "url": "https://github.com/TAIY2020"
+  },
+  "license": "MIT",
+  "host_application": {
+    "min_version": "0.10.2",
+    "max_version": "0.12.2"
+  },
+  "homepage_url": "https://github.com/TAIY2020/custom_commands_plugin",
+  "repository_url": "https://github.com/TAIY2020/custom_commands_plugin",
+  "keywords": [
+    "custom command",
+    "dynamic reply",
+    "自定义命令",
+    "自动回复"
+  ],
+  "categories": [
+    "Utility Tools",
+    "Content Generation",
+    "Other"
+  ],
+  "default_locale": "zh-CN",
+  "locales_path": "_locales",
+  "plugin_info": {
+    "is_built_in": false
+  }
 }
