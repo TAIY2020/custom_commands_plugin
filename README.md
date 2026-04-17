@@ -184,7 +184,7 @@ enable_group_isolation = false
 v2.1.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
 | 项目 | v1.x (旧版) | v2.1.0 (新版) |
-|------|-------------|---------------|
+| ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
 | 命令注册 | `BaseCommand` 子类 + `get_plugin_components()` | `@Command` 装饰器 |
 | 配置管理 | `config_schema` 字典 + `ConfigField` | `PluginConfigBase` 强类型模型 (Pydantic) |
