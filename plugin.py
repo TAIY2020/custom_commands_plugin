@@ -90,7 +90,7 @@ class SettingsSection(PluginConfigBase):
         description="群组作用域映射。键为作用域名称，值为该作用域下的群号列表",
         json_schema_extra={
             "label": "群组映射",
-            "hint": '在 [settings.group_scopes] 段下添加: 魔方群 = ["1074944851", "1003415825"]',
+            "hint": '在 [settings.group_scopes] 段下添加: "游戏组" = ["111111", "222222"]',
         },
     )
     max_trigger_length: int = Field(
