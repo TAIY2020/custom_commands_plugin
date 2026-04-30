@@ -4,7 +4,7 @@
 
 这个插件赋予了麦麦一个"可编程"的记忆。管理员可以在聊天中随时“教”麦麦新的命令和回复，而无需重启或修改任何代码。所有添加的命令都会被永久保存。
 
-> 本版本 (v2.1.0) 基于 **MaiBot SDK v2** 重写，使用 `@Command` 装饰器和 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本 (v2.2.0) 基于 **MaiBot SDK v2** 重写，使用 `@Command` 装饰器和 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -12,7 +12,7 @@
 - **权限控制**: 仅限指定管理员可以添加或删除命令，确保安全可控。
 - **多格式支持**: 回复内容可以是纯文本，也可以是图片。
 - **路径安全**: 内置路径穿越检测，添加命令时即拒绝非法路径，触发时二次校验，防止恶意文件名访问图片目录以外的文件。
-- **图片大小限制**: 自动检测图片文件大小，超过 10MB 的图片将被拒绝发送，防止内存溢出。
+- **图片大小限制**: 自动检测图片文件大小，超过设定值（默认 10MB）的图片将被拒绝发送，防止内存溢出。
 - **输入校验**: 触发词最多 50 字符，回复内容最多 2000 字符，每个作用域最多 500 条命令。
 - **并发安全**: 所有写操作通过异步锁保护，防止多人同时操作导致数据竞争。
 - **异步非阻塞**: 数据保存使用异步写入，不阻塞事件循环，高并发场景下也不会卡顿。
@@ -47,8 +47,8 @@
 ```toml
 [plugin]
 name = "custom_commands_plugin"
-version = "2.1.0"
-config_version = "2.1.0"
+version = "2.2.0"
+config_version = "2.2.0"
 enabled = true
 
 [settings]
@@ -56,6 +56,10 @@ command_prefix = "."
 admin_user_ids = []
 image_directory = "plugins/custom_commands_plugin/images"
 enable_group_isolation = false
+max_trigger_length = 50
+max_response_length = 2000
+max_commands_per_scope = 500
+max_image_size = 10485760
 
 [settings.group_scopes]
 # 群组作用域映射，键为作用域名称，值为该作用域下的群号列表。作用域名称相同的群组将共享同一套命令
@@ -69,6 +73,9 @@ enable_group_isolation = false
 - **`image_directory`**: 指定了存放回复图片的文件夹路径，相对于主程序根目录。默认路径 `plugins/custom_commands_plugin/images` 会被自动创建。您可以将图片放入此文件夹，然后通过文件名来调用。
 - **`enable_group_isolation`**: 控制群组隔离模式。默认为 `false`，表示所有群聊共享同一套全局命令。若设置为 `true`，则每个群聊将拥有独立的命令库，但依然可以调用全局命令。
 - **`group_scopes`**: 允许您将多个群号映射到同一个自定义名称，实现这些群共享一套命令。例：在 `[settings.group_scopes]` 段下添加 `游戏组 = ["111111", "222222"]`，则这两个群将共享同一套命令。
+- **`max_trigger_length` / `max_response_length`**: 触发词与回复内容的字符长度上限，默认 `50` / `2000`。
+- **`max_commands_per_scope`**: 单个作用域内允许的最大命令数，默认 `500`，超过后写入会报错。
+- **`max_image_size`**: 单张图片允许的最大字节数，默认 `10485760`（10MB），超过后会拒绝发送。
 
 ---
 
@@ -83,7 +90,7 @@ enable_group_isolation = false
 使用 `.问：...答：...` 的格式来教麦麦新的回复。
 
 - **格式**: `.问：<触发词>答：<回复内容>`
-- **限制**: 触发词最多 50 字符，回复内容最多 2000 字符，每个作用域最多 500 条命令。
+- **限制**: 默认触发词最多 50 字符、回复内容最多 2000 字符、每个作用域最多 500 条命令；这些上限均可在 `[settings]` 中调整。
 - **示例 (文本回复)**:
 
   ```text
@@ -181,9 +188,9 @@ enable_group_isolation = false
 
 ## 🔄 从 v1.x 升级
 
-v2.1.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
+v2.2.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
-| 项目 | v1.x (旧版) | v2.1.0 (新版) |
+| 项目 | v1.x (旧版) | v2.2.0 (新版) |
 | ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
 | 命令注册 | `BaseCommand` 子类 + `get_plugin_components()` | `@Command` 装饰器 |
@@ -203,7 +210,7 @@ v2.1.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 ## 📝 注意事项
 
 - **命令优先级**: `添加`、`删除`、`删全局`、`列表` 这几个管理命令的优先级高于您自定义的触发命令。例如，即使你创建了一个名为“列表”的自定义命令，输入 `.列表` 时，也总是会触发“列出所有命令”的功能。
-- **图片路径**: 调用回复图片内容时需确保图片放在 `images` 文件夹内（默认路径为 `plugins/custom_commands_plugin/images`），且单个文件大小不超过 10MB。
+- **图片路径**: 调用回复图片内容时需确保图片放在 `images` 文件夹内（默认路径为 `plugins/custom_commands_plugin/images`），且单个文件大小不超过 `max_image_size` 配置项（默认 10MB）。
 - **数据文件**: 所有数据存储在 `custom_commands.json`。插件使用原子写入保护数据安全。请勿手动编辑 `custom_commands.json` 文件，除非你完全清楚其结构和后果。错误的操作可能导致插件无法读取数据。
 - **配置格式**: `[settings.group_scopes]` 段下直接写键值对即可（如 `游戏群 = ["123456", "654321"]`）。
 

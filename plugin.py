@@ -23,11 +23,11 @@ logger = logging.getLogger("plugin.custom_commands")
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "2.1.0"
-MAX_TRIGGER_LENGTH = 50          # 触发词最大长度
-MAX_RESPONSE_LENGTH = 2000       # 回复内容最大长度
-MAX_COMMANDS_PER_SCOPE = 500     # 每个作用域最大命令数
-MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 图片文件最大 10MB
+PLUGIN_VERSION = "2.2.0"
+DEFAULT_MAX_TRIGGER_LENGTH = 50           # 触发词默认最大长度
+DEFAULT_MAX_RESPONSE_LENGTH = 2000        # 回复内容默认最大长度
+DEFAULT_MAX_COMMANDS_PER_SCOPE = 500      # 每个作用域默认最大命令数
+DEFAULT_MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 图片文件默认最大 10MB
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 
@@ -92,6 +92,34 @@ class SettingsSection(PluginConfigBase):
             "label": "群组映射",
             "hint": '在 [settings.group_scopes] 段下添加: 魔方群 = ["1074944851", "1003415825"]',
         },
+    )
+    max_trigger_length: int = Field(
+        default=DEFAULT_MAX_TRIGGER_LENGTH,
+        description="触发词最大长度",
+        ge=1,
+        le=500,
+        json_schema_extra={"label": "触发词最大长度"},
+    )
+    max_response_length: int = Field(
+        default=DEFAULT_MAX_RESPONSE_LENGTH,
+        description="回复内容最大长度",
+        ge=1,
+        le=20000,
+        json_schema_extra={"label": "回复内容最大长度"},
+    )
+    max_commands_per_scope: int = Field(
+        default=DEFAULT_MAX_COMMANDS_PER_SCOPE,
+        description="每个作用域最大命令数",
+        ge=1,
+        le=10000,
+        json_schema_extra={"label": "单作用域命令上限"},
+    )
+    max_image_size: int = Field(
+        default=DEFAULT_MAX_IMAGE_SIZE,
+        description="图片文件最大字节数",
+        ge=1024,
+        le=100 * 1024 * 1024,
+        json_schema_extra={"label": "图片大小上限（字节）"},
     )
 
 
@@ -219,7 +247,8 @@ class CommandDataManager:
         return None
 
     async def add(self, trigger: str, response: str, scope_id: str,
-                  enable_isolation: bool, group_scopes: Dict[str, List[str]]) -> str:
+                  enable_isolation: bool, group_scopes: Dict[str, List[str]],
+                  max_per_scope: int = DEFAULT_MAX_COMMANDS_PER_SCOPE) -> str:
         """添加命令到计算出的作用域（带并发锁和数量上限）。
 
         Raises:
@@ -232,10 +261,10 @@ class CommandDataManager:
             # 检查命令数量上限（更新已有命令不受限制）
             if (
                 trigger not in self.commands[scope]
-                and len(self.commands[scope]) >= MAX_COMMANDS_PER_SCOPE
+                and len(self.commands[scope]) >= max_per_scope
             ):
                 raise ValueError(
-                    f"作用域 '{scope}' 已达到最大命令数 {MAX_COMMANDS_PER_SCOPE}"
+                    f"作用域 '{scope}' 已达到最大命令数 {max_per_scope}"
                 )
             self.commands[scope][trigger] = response
             await self.save()
@@ -347,6 +376,20 @@ class CustomCommandsPlugin(MaiBotPlugin):
         """获取当前上下文的作用域 ID。"""
         return group_id if group_id else user_id
 
+    def _resolve_safe_image_path(self, response: str) -> Optional[Path]:
+        """将回复内容解析为 image_directory 内的安全路径。
+
+        Returns:
+            合法时返回解析后的绝对 Path；包含路径穿越或越界时返回 None。
+        """
+        image_base_dir = Path(self.config.settings.image_directory).resolve()
+        image_path = (image_base_dir / response).resolve()
+        try:
+            image_path.relative_to(image_base_dir)
+        except ValueError:
+            return None
+        return image_path
+
     def _build_list_header_text(self, scope_id: str, current_scope: str) -> str:
         """构造列表头部文本。"""
         header_text = f"📋 自定义命令列表\n当前ID: {scope_id}\n对应作用域: {current_scope}"
@@ -398,12 +441,23 @@ class CustomCommandsPlugin(MaiBotPlugin):
         return None
 
     async def _send_list_as_forward(self, header_text: str, list_content: str,
-                                    group_id: str, user_id: str) -> Optional[str]:
-        """使用 Napcat 合并转发发送列表。"""
+                                    group_id: str, user_id: str,
+                                    triggers: Optional[List[str]] = None,
+                                    prefix: str = "") -> Optional[str]:
+        """使用 Napcat 合并转发发送列表。
+
+        Args:
+            triggers: 用于在卡片预览（news）中展示的触发词列表，最多取前 4 条。
+            prefix: 命令前缀，用于在 news 文本中拼接。
+        """
         message_nodes = [
             self._build_forward_node(header_text),
             self._build_forward_node(list_content),
         ]
+
+        news = [
+            {"text": f"{prefix}{t}"} for t in (triggers or [])[:4]
+        ] or [{"text": "点击查看完整列表"}]
 
         if group_id:
             api_result = await self.ctx.api.call(
@@ -412,6 +466,8 @@ class CustomCommandsPlugin(MaiBotPlugin):
                     "message_type": "group",
                     "group_id": self._parse_forward_target_id(group_id, "group_id"),
                     "message": message_nodes,
+                    "source": "自定义命令",
+                    "news": news,
                     "summary": "自定义命令列表",
                     "prompt": "点击查看命令列表",
                 },
@@ -424,6 +480,8 @@ class CustomCommandsPlugin(MaiBotPlugin):
                 "message_type": "private",
                 "user_id": self._parse_forward_target_id(user_id, "user_id"),
                 "message": message_nodes,
+                "source": "自定义命令",
+                "news": news,
                 "summary": "自定义命令列表",
                 "prompt": "点击查看命令列表",
             },
@@ -462,24 +520,20 @@ class CustomCommandsPlugin(MaiBotPlugin):
             return False, "格式错误", True
 
         # 输入长度校验
-        if len(trigger) > MAX_TRIGGER_LENGTH:
+        if len(trigger) > self.config.settings.max_trigger_length:
             await self.ctx.send.text(
-                f"❌ 触发词过长（最多 {MAX_TRIGGER_LENGTH} 字符）", stream_id,
+                f"❌ 触发词过长（最多 {self.config.settings.max_trigger_length} 字符）", stream_id,
             )
             return False, "触发词过长", True
-        if len(response) > MAX_RESPONSE_LENGTH:
+        if len(response) > self.config.settings.max_response_length:
             await self.ctx.send.text(
-                f"❌ 回复内容过长（最多 {MAX_RESPONSE_LENGTH} 字符）", stream_id,
+                f"❌ 回复内容过长（最多 {self.config.settings.max_response_length} 字符）", stream_id,
             )
             return False, "回复内容过长", True
 
         # 图片路径安全校验：在写入前拒绝含路径穿越的回复内容
         if response.lower().endswith(IMAGE_EXTENSIONS):
-            image_base_dir = Path(self.config.settings.image_directory).resolve()
-            image_path = (image_base_dir / response).resolve()
-            try:
-                image_path.relative_to(image_base_dir)
-            except ValueError:
+            if self._resolve_safe_image_path(response) is None:
                 logger.warning("添加命令时检测到路径穿越尝试: '%s'", response)
                 await self.ctx.send.text("❌ 图片路径不合法，不允许包含路径穿越", stream_id)
                 return False, "路径穿越被阻止", True
@@ -491,6 +545,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         try:
             scope_used = await self._data_manager.add(
                 trigger, response, scope_id, isolation, group_scopes,
+                max_per_scope=self.config.settings.max_commands_per_scope,
             )
         except ValueError as exc:
             await self.ctx.send.text(f"❌ {exc}", stream_id)
@@ -620,7 +675,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
             # triggers 已在 get_triggers_for_scope 中排序
             list_content = "\n".join(f"▪️ {prefix}{trigger}" for trigger in triggers)
             try:
-                forward_error = await self._send_list_as_forward(header_text, list_content, group_id, user_id)
+                forward_error = await self._send_list_as_forward(
+                    header_text, list_content, group_id, user_id,
+                    triggers=triggers, prefix=prefix,
+                )
             except ValueError as exc:
                 logger.error("发送命令列表时目标 ID 非法: %s", exc)
                 await self.ctx.send.text(f"❌ 发送命令列表失败：{exc}", stream_id)
@@ -666,13 +724,9 @@ class CustomCommandsPlugin(MaiBotPlugin):
 
         # 判断是否为图片回复
         if response_value.lower().endswith(IMAGE_EXTENSIONS):
-            image_base_dir = Path(self.config.settings.image_directory).resolve()
-            image_path = (image_base_dir / response_value).resolve()
-
             # 路径安全检查：防止路径穿越攻击（如 ../../etc/passwd）
-            try:
-                image_path.relative_to(image_base_dir)
-            except ValueError:
+            image_path = self._resolve_safe_image_path(response_value)
+            if image_path is None:
                 logger.warning("检测到路径穿越尝试: '%s'", response_value)
                 await self.ctx.send.text("❌ 图片路径不合法", stream_id)
                 return False, "路径穿越被阻止", True
@@ -693,9 +747,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
                 await self.ctx.send.text("❌ 读取图片文件时发生错误", stream_id)
                 return False, "读取图片失败", True
 
-            if file_size > MAX_IMAGE_SIZE:
+            max_image_size = self.config.settings.max_image_size
+            if file_size > max_image_size:
                 size_mb = file_size / (1024 * 1024)
-                limit_mb = MAX_IMAGE_SIZE / (1024 * 1024)
+                limit_mb = max_image_size / (1024 * 1024)
                 await self.ctx.send.text(
                     f"❌ 图片文件过大（{size_mb:.1f}MB，上限 {limit_mb:.0f}MB）",
                     stream_id,
