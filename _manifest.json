@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "version": "2.2.0",
-  "name": "自定义命令插件|CustomCommands Plugin",
+  "name": "自定义命令插件 | CustomCommands Plugin",
   "description": "一个允许你通过聊天命令动态添加、删除、列出和触发自定义回复的强大插件，支持群组数据隔离与自定义分组映射。",
   "author": {
     "name": "TaiYang",
