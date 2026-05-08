@@ -23,7 +23,7 @@ logger = logging.getLogger("plugin.custom_commands")
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "2.2.0"
+PLUGIN_VERSION = "2.2.1"
 DEFAULT_MAX_TRIGGER_LENGTH = 50           # 触发词默认最大长度
 DEFAULT_MAX_RESPONSE_LENGTH = 2000        # 回复内容默认最大长度
 DEFAULT_MAX_COMMANDS_PER_SCOPE = 500      # 每个作用域默认最大命令数
@@ -76,8 +76,8 @@ class SettingsSection(PluginConfigBase):
         json_schema_extra={"label": "管理员列表", "hint": "留空 [] 表示任何人都没有权限"},
     )
     image_directory: str = Field(
-        default="plugins/custom_commands_plugin/images",
-        description="存放自定义回复图片的目录路径（相对于主程序根目录）",
+        default="images",
+        description="存放自定义回复图片的目录路径（相对路径基于插件目录解析，也可填写绝对路径）",
         json_schema_extra={"label": "图片目录"}
     )
     enable_group_isolation: bool = Field(
@@ -334,10 +334,9 @@ class CustomCommandsPlugin(MaiBotPlugin):
         # 缓存管理员集合
         self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
 
-        # 确保图片目录存在
-        image_dir = self.config.settings.image_directory
+        # 确保图片目录存在（基于插件目录解析，避免依赖文件夹的具体名称）
         try:
-            Path(image_dir).mkdir(parents=True, exist_ok=True)
+            self._resolve_image_dir().mkdir(parents=True, exist_ok=True)
         except OSError as e:
             logger.warning("创建图片目录失败: %s，图片功能可能不可用", e)
 
@@ -357,11 +356,22 @@ class CustomCommandsPlugin(MaiBotPlugin):
             self._data_manager.rebuild_reverse_map(self.config.settings.group_scopes)
             # 图片目录可能被修改，确保新目录存在
             try:
-                Path(self.config.settings.image_directory).mkdir(parents=True, exist_ok=True)
+                self._resolve_image_dir().mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 logger.warning("热重载后创建图片目录失败: %s", e)
 
     # ===== 权限与作用域辅助方法 =====
+
+    def _resolve_image_dir(self) -> Path:
+        """将配置中的 image_directory 解析为绝对 Path。
+        相对路径基于插件目录解析，绝对路径直接使用。
+        """
+        configured = self.config.settings.image_directory
+        path = Path(configured)
+        if not path.is_absolute():
+            base = Path(self._plugin_dir) if self._plugin_dir else Path.cwd()
+            path = base / path
+        return path.resolve()
 
     def _check_admin(self, user_id: str) -> bool:
         """检查用户是否有管理员权限（使用缓存集合）。"""
@@ -382,7 +392,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         Returns:
             合法时返回解析后的绝对 Path；包含路径穿越或越界时返回 None。
         """
-        image_base_dir = Path(self.config.settings.image_directory).resolve()
+        image_base_dir = self._resolve_image_dir()
         image_path = (image_base_dir / response).resolve()
         try:
             image_path.relative_to(image_base_dir)

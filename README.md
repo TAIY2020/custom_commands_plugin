@@ -4,7 +4,7 @@
 
 这个插件赋予了麦麦一个“可编程”的记忆。管理员可以在聊天中随时“教”麦麦新的命令和回复，而无需重启或修改任何代码。所有添加的命令都会被永久保存。
 
-> 本版本 (v2.2.0) 基于 **MaiBot SDK v2** 重写，使用 `@Command` 装饰器和 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
+> 本版本 (v2.2.1) 基于 **MaiBot SDK v2** 重写，使用 `@Command` 装饰器和 `PluginConfigBase` 强类型配置模型，支持配置热重载和 Web UI 配置。
 
 ## ✨ 功能特性
 
@@ -47,14 +47,14 @@
 ```toml
 [plugin]
 name = "custom_commands_plugin"
-version = "2.2.0"
-config_version = "2.2.0"
+version = "2.2.1"
+config_version = "2.2.1"
 enabled = true
 
 [settings]
 command_prefix = "."
 admin_user_ids = []
-image_directory = "plugins/custom_commands_plugin/images"
+image_directory = "images"
 enable_group_isolation = false
 max_trigger_length = 50
 max_response_length = 2000
@@ -70,7 +70,7 @@ max_image_size = 10485760
 
 - **`command_prefix`**: 定义了所有命令的触发前缀，默认为 `.`。
 - **`admin_user_ids`**: 这是一个**核心安全设置**。默认值为一个**空列表 `[]`**，这意味着**默认情况下，任何人都没有权限**添加或删除命令。**您必须手动编辑配置文件**（或通过 Web UI），将管理员的 QQ 号添加到这个列表中，才能使用管理员命令。
-- **`image_directory`**: 指定了存放回复图片的文件夹路径，相对于主程序根目录。默认路径 `plugins/custom_commands_plugin/images` 会被自动创建。您可以将图片放入此文件夹，然后通过文件名来调用。
+- **`image_directory`**: 指定了存放回复图片的文件夹路径。**相对路径基于插件目录解析**（默认 `images` 即插件目录下的 `images/` 子文件夹），也支持填写绝对路径。该目录会被自动创建。您可以将图片放入此文件夹，然后通过文件名来调用。
 - **`enable_group_isolation`**: 控制群组隔离模式。默认为 `false`，表示所有群聊共享同一套全局命令。若设置为 `true`，则每个群聊将拥有独立的命令库，但依然可以调用全局命令。
 - **`group_scopes`**: 允许您将多个群号映射到同一个自定义名称，实现这些群共享一套命令。例：在 `[settings.group_scopes]` 段下添加 `"游戏组" = ["111111", "222222"]`，则这两个群将共享同一套命令。
 - **`max_trigger_length` / `max_response_length`**: 触发词与回复内容的字符长度上限，默认 `50` / `2000`。
@@ -188,9 +188,9 @@ max_image_size = 10485760
 
 ## 🔄 从 v1.x 升级
 
-v2.2.0 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
+v2.2.1 是基于 MaiBot SDK v2 的完全重写版本，主要变化如下：
 
-| 项目 | v1.x (旧版) | v2.2.0 (新版) |
+| 项目 | v1.x (旧版) | v2.2.1 (新版) |
 | ---- | ----------- | ------------- |
 | SDK 依赖 | `src.plugin_system` (内置插件系统) | `maibot_sdk` v2 |
 | 命令注册 | `BaseCommand` 子类 + `get_plugin_components()` | `@Command` 装饰器 |
