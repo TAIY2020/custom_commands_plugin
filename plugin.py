@@ -10,6 +10,7 @@
 """
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+from pydantic import model_validator
 
 import asyncio
 import base64
@@ -23,7 +24,7 @@ logger = logging.getLogger("plugin.custom_commands")
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "2.2.1"
+PLUGIN_VERSION = "2.2.3"
 DEFAULT_MAX_TRIGGER_LENGTH = 50           # 触发词默认最大长度
 DEFAULT_MAX_RESPONSE_LENGTH = 2000        # 回复内容默认最大长度
 DEFAULT_MAX_COMMANDS_PER_SCOPE = 500      # 每个作用域默认最大命令数
@@ -85,12 +86,13 @@ class SettingsSection(PluginConfigBase):
         description="是否开启群组隔离。开启后未映射的群组将使用各自独立的命令库",
         json_schema_extra={"label": "启用群组隔离"}
     )
-    group_scopes: Dict[str, List[str]] = Field(
-        default={ },
-        description="群组作用域映射。键为作用域名称，值为该作用域下的群号列表",
+    group_scopes: List[str] = Field(
+        default_factory=list,
+        description="群组作用域映射列表。每条格式: 作用域名:群号1,群号2,...",
         json_schema_extra={
             "label": "群组映射",
-            "hint": '在 [settings.group_scopes] 段下添加: "游戏组" = ["111111", "222222"]',
+            "hint": "每条格式：作用域名:群号1,群号2  例：游戏组:111111,222222",
+            "placeholder": "游戏组:111111,222222",
         },
     )
     max_trigger_length: int = Field(
@@ -121,6 +123,45 @@ class SettingsSection(PluginConfigBase):
         le=100 * 1024 * 1024,
         json_schema_extra={"label": "图片大小上限（字节）"},
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_group_scopes(cls, data: Any) -> Any:
+        """兼容旧 dict 格式 group_scopes，并清洗每条两端可能多余的引号。
+        """
+        if not isinstance(data, dict):
+            return data
+        legacy = data.get("group_scopes")
+        if isinstance(legacy, dict):
+            converted: List[str] = []
+            for name, ids in legacy.items():
+                if not isinstance(ids, (list, tuple)):
+                    continue
+                ids_str = ",".join(str(item).strip() for item in ids if str(item).strip())
+                if str(name).strip() and ids_str:
+                    converted.append(f"{str(name).strip()}:{ids_str}")
+            data["group_scopes"] = converted
+        elif isinstance(legacy, list):
+            cleaned: List[str] = []
+            for item in legacy:
+                if not isinstance(item, str):
+                    continue
+                stripped = cls._strip_paired_quotes(item.strip())
+                if stripped:
+                    cleaned.append(stripped)
+            data["group_scopes"] = cleaned
+        return data
+
+    @staticmethod
+    def _strip_paired_quotes(text: str) -> str:
+        """循环剥掉字符串两端的成对引号（单/双），最多剥两层防御异常输入。"""
+        result = text
+        for _ in range(2):
+            if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
+                result = result[1:-1].strip()
+            else:
+                break
+        return result
 
 
 class CustomCommandsConfig(PluginConfigBase):
@@ -218,6 +259,16 @@ class CommandDataManager:
         """解析当前 ID 对应的数据作用域。
 
         优先级：group_scopes 映射 > 群组隔离 > global
+
+        - 命中 group_scopes 映射 → 使用映射的作用域名（不受隔离开关影响）
+        - 未命中 + 隔离开启 → 使用 scope_id 自身作为作用域
+        - 未命中 + 隔离关闭 → 使用 global
+
+        这样可同时支持四种用法：
+          1) isolation=False + 空 scopes → 全部 global
+          2) isolation=False + 非空 scopes → 默认 global，指定群共享独立小圈子
+          3) isolation=True  + 空 scopes → 每群独立 scope
+          4) isolation=True  + 非空 scopes → 命中映射用映射，未命中各自独立
 
         使用 rebuild_reverse_map() 预构建的缓存进行 O(1) 查找。
         """
@@ -320,6 +371,35 @@ class CustomCommandsPlugin(MaiBotPlugin):
         self._data_manager = CommandDataManager()
         self._plugin_dir: str = ""
         self._admin_set: set[str] = set()  # 缓存管理员集合
+        self._group_scopes_cache: Dict[str, List[str]] = {}  # 解析后的群组映射缓存
+
+    @staticmethod
+    def _parse_group_scopes(scopes: List[str]) -> Dict[str, List[str]]:
+        """将 List[str] 格式的 group_scopes 解析为 {作用域名: [群号]}。
+
+        每条字符串约定语法 "作用域名:群号1,群号2"。
+        非法/空条目静默跳过，重复作用域名后者覆盖前者。
+        防御性剥掉外层成对引号，防止用户照旧示例输入时残留干扰解析。
+        """
+        result: Dict[str, List[str]] = {}
+        for entry in scopes or []:
+            if not isinstance(entry, str):
+                continue
+            cleaned = SettingsSection._strip_paired_quotes(entry.strip())
+            if ":" not in cleaned:
+                continue
+            name, _, ids_part = cleaned.partition(":")
+            name = name.strip()
+            if not name:
+                continue
+            group_ids = [g.strip() for g in ids_part.split(",") if g.strip()]
+            if group_ids:
+                result[name] = group_ids
+        return result
+
+    def _refresh_group_scopes_cache(self) -> None:
+        """刷新群组映射解析缓存，应在配置加载与热重载时调用。"""
+        self._group_scopes_cache = self._parse_group_scopes(self.config.settings.group_scopes)
 
     async def on_load(self) -> None:
         """插件加载时初始化数据管理器和图片目录。"""
@@ -328,8 +408,11 @@ class CustomCommandsPlugin(MaiBotPlugin):
         # 加载命令数据
         self._data_manager.load(self._plugin_dir)
 
+        # 解析并缓存群组映射
+        self._refresh_group_scopes_cache()
+
         # 构建反向索引缓存
-        self._data_manager.rebuild_reverse_map(self.config.settings.group_scopes)
+        self._data_manager.rebuild_reverse_map(self._group_scopes_cache)
 
         # 缓存管理员集合
         self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
@@ -352,8 +435,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
         if scope == "self":
             # 刷新管理员缓存
             self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
+            # 刷新群组映射解析缓存
+            self._refresh_group_scopes_cache()
             # 刷新反向索引缓存
-            self._data_manager.rebuild_reverse_map(self.config.settings.group_scopes)
+            self._data_manager.rebuild_reverse_map(self._group_scopes_cache)
             # 图片目录可能被修改，确保新目录存在
             try:
                 self._resolve_image_dir().mkdir(parents=True, exist_ok=True)
@@ -550,7 +635,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
 
         scope_id = self._get_scope_id(group_id, user_id)
         isolation = self.config.settings.enable_group_isolation
-        group_scopes = self.config.settings.group_scopes
+        group_scopes = self._group_scopes_cache
 
         try:
             scope_used = await self._data_manager.add(
@@ -597,7 +682,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         trigger = matched_groups.get("trigger", "").strip()
         scope_id = self._get_scope_id(group_id, user_id)
         isolation = self.config.settings.enable_group_isolation
-        group_scopes = self.config.settings.group_scopes
+        group_scopes = self._group_scopes_cache
         success, scope_used = await self._data_manager.delete(
             trigger, scope_id, isolation, group_scopes,
         )
@@ -670,7 +755,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
 
         scope_id = self._get_scope_id(group_id, user_id)
         isolation = self.config.settings.enable_group_isolation
-        group_scopes = self.config.settings.group_scopes
+        group_scopes = self._group_scopes_cache
         triggers = self._data_manager.get_triggers_for_scope(scope_id, isolation, group_scopes)
         current_scope = self._data_manager.resolve_scope(scope_id, isolation, group_scopes)
         prefix = self.config.settings.command_prefix
@@ -726,7 +811,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
 
         scope_id = self._get_scope_id(group_id, user_id)
         isolation = self.config.settings.enable_group_isolation
-        group_scopes = self.config.settings.group_scopes
+        group_scopes = self._group_scopes_cache
         response_value = self._data_manager.get(trigger, scope_id, isolation, group_scopes)
 
         if response_value is None:
