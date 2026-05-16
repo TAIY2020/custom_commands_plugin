@@ -47,8 +47,8 @@
 ```toml
 [plugin]
 name = "custom_commands_plugin"
-version = "2.2.2.3"
-config_version = "2.2.2.3"
+version = "2.2.5"
+config_version = "2.2.5"
 enabled = true
 
 [settings]

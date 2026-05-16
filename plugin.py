@@ -3,10 +3,13 @@
 通过聊天命令动态添加、删除、列出和触发自定义回复，支持文本和图片。
 支持群组数据隔离与自定义分组映射。
 
-所有命令使用 @Command 装饰器注册，pattern 为精确匹配，不影响其他插件。
-命令前缀默认为 "."，可在 config.toml 中配置。
-由于 @Command 的 pattern 在注册时静态编译，正则使用 [^\\w\\s] 匹配前缀位置，
-再在 handler 内部通过 self.config 校验实际前缀。
+所有命令使用 @Command 装饰器注册。装饰器声明阶段 pattern 中的前缀占位写作
+[^\\w\\s]（任意非字母数字非空白字符），随后在 get_components() 中读取
+self.config.settings.command_prefix，把该占位重写为 re.escape(prefix)，
+从而让 Runner 注册的正则只匹配实际配置的前缀。这样可避免与其他插件的
+命令在主程序"第一个命中独占"的分发逻辑下相互抢匹配。
+命令前缀默认为 "."，可在 config.toml 中配置；热改后会通过 component.reload_plugin
+自动触发本插件重载，使新前缀立即生效。
 """
 
 from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
@@ -17,6 +20,7 @@ import base64
 import json
 import logging
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -24,12 +28,16 @@ logger = logging.getLogger("plugin.custom_commands")
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "2.2.3"
+PLUGIN_VERSION = "2.2.5"
 DEFAULT_MAX_TRIGGER_LENGTH = 50           # 触发词默认最大长度
 DEFAULT_MAX_RESPONSE_LENGTH = 2000        # 回复内容默认最大长度
 DEFAULT_MAX_COMMANDS_PER_SCOPE = 500      # 每个作用域默认最大命令数
 DEFAULT_MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 图片文件默认最大 10MB
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
+
+# Command pattern 中前缀占位符——装饰器声明阶段无法访问 self.config，
+# 这里先用通配占位，get_components() 阶段再用 re.escape(配置前缀) 重写为精确匹配。
+PREFIX_PLACEHOLDER = r"[^\w\s]"
 
 
 # --- 配置模型 ---
@@ -372,6 +380,8 @@ class CustomCommandsPlugin(MaiBotPlugin):
         self._plugin_dir: str = ""
         self._admin_set: set[str] = set()  # 缓存管理员集合
         self._group_scopes_cache: Dict[str, List[str]] = {}  # 解析后的群组映射缓存
+        self._registered_prefix: Optional[str] = None  # 注册到主程序时使用的 prefix，用于检测热改
+        self._self_reload_scheduled: bool = False  # 标记是否已调度自重载任务，防重入
 
     @staticmethod
     def _parse_group_scopes(scopes: List[str]) -> Dict[str, List[str]]:
@@ -400,6 +410,45 @@ class CustomCommandsPlugin(MaiBotPlugin):
     def _refresh_group_scopes_cache(self) -> None:
         """刷新群组映射解析缓存，应在配置加载与热重载时调用。"""
         self._group_scopes_cache = self._parse_group_scopes(self.config.settings.group_scopes)
+
+    def get_components(self) -> List[Dict[str, Any]]:
+        """重写组件收集：将 Command pattern 里的前缀占位符替换为实际配置的前缀。
+
+        主程序的命令分发是"第一个 pattern 命中即独占"，handler 内部返回 False
+        无法让分发器去尝试下一个 handler。若本插件的 Command pattern 用通配占位
+        ([^\\w\\s]) 注册，会贪婪地"吃掉"任何"符号+任意内容"的消息，导致其他
+        插件（例如 .余额 / .ddl 等）永远无法被路由到。
+
+        在此把占位符重写成 re.escape(prefix)，使注册的正则只匹配实际配置的前缀，
+        彻底回避跨插件抢匹配。同时由于 set_plugin_config() 调用在
+        get_components() 之前完成，self.config 在此处已经可用。
+
+        热重载场景：主程序在 on_config_update 后不会重新调用 get_components；
+        on_config_update 检测到 prefix 变化时会通过 ctx.component.reload_plugin
+        主动触发本插件重载，让 get_components 重新执行，主程序据此重新编译命令正则。
+        """
+        components = super().get_components()
+        try:
+            prefix = self.config.settings.command_prefix
+        except Exception:
+            return components
+
+        if not prefix:
+            return components
+
+        escaped_prefix = re.escape(prefix)
+        for comp in components:
+            if comp.get("type") != "COMMAND":
+                continue
+            metadata = comp.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            pattern = metadata.get("command_pattern", "")
+            if not isinstance(pattern, str) or PREFIX_PLACEHOLDER not in pattern:
+                continue
+            metadata["command_pattern"] = pattern.replace(PREFIX_PLACEHOLDER, escaped_prefix)
+        self._registered_prefix = prefix
+        return components
 
     async def on_load(self) -> None:
         """插件加载时初始化数据管理器和图片目录。"""
@@ -444,6 +493,51 @@ class CustomCommandsPlugin(MaiBotPlugin):
                 self._resolve_image_dir().mkdir(parents=True, exist_ok=True)
             except OSError as e:
                 logger.warning("热重载后创建图片目录失败: %s", e)
+            # 命令前缀变更后，通过 ctx.component.reload_plugin 主动触发自身热重载
+            # 让 get_components重新执行，主程序据此重新编译命令正则。
+            new_prefix = self.config.settings.command_prefix
+            if (
+                self._registered_prefix is not None
+                and new_prefix != self._registered_prefix
+                and not self._self_reload_scheduled
+            ):
+                self._self_reload_scheduled = True
+                asyncio.create_task(
+                    self._reload_self_after_prefix_change(self._registered_prefix, new_prefix)
+                )
+
+    async def _reload_self_after_prefix_change(self, old_prefix: str, new_prefix: str) -> None:
+        """命令前缀变更后，让 Host 重新加载本插件，让新前缀生效。
+
+        必须先把控制权交回事件循环，让本次 on_config_update 完整返回，再发起 reload，
+        否则当前协程会与即将到来的 on_unload 串行执行而存在死锁风险。
+        """
+        await asyncio.sleep(0)
+        plugin_id = ""
+        try:
+            plugin_id = self.ctx.plugin_id
+        except Exception as exc:
+            logger.error("命令前缀变更后无法获取 plugin_id：%s；请手动重载插件让新前缀生效", exc)
+            return
+
+        logger.info(
+            "检测到命令前缀已从 %r 修改为 %r，正在自动重载插件 %s 让新前缀生效",
+            old_prefix, new_prefix, plugin_id,
+        )
+        try:
+            result = await self.ctx.component.reload_plugin(plugin_id)
+        except Exception as exc:
+            logger.error(
+                "自动重载插件 %s 失败：%s；请在插件管理器中手动重载使新前缀生效",
+                plugin_id, exc, exc_info=True,
+            )
+            return
+
+        if isinstance(result, dict) and not result.get("success", True):
+            logger.error(
+                "自动重载插件 %s 失败：%s；请在插件管理器中手动重载使新前缀生效",
+                plugin_id, result.get("error", "未知错误"),
+            )
 
     # ===== 权限与作用域辅助方法 =====
 
