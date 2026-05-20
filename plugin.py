@@ -3,16 +3,19 @@
 通过聊天命令动态添加、删除、列出和触发自定义回复，支持文本和图片。
 支持群组数据隔离与自定义分组映射。
 
-所有命令使用 @Command 装饰器注册。装饰器声明阶段 pattern 中的前缀占位写作
-[^\\w\\s]（任意非字母数字非空白字符），随后在 get_components() 中读取
-self.config.settings.command_prefix，把该占位重写为 re.escape(prefix)，
-从而让 Runner 注册的正则只匹配实际配置的前缀。这样可避免与其他插件的
-命令在主程序"第一个命中独占"的分发逻辑下相互抢匹配。
-命令前缀默认为 "."，可在 config.toml 中配置；热改后会通过 component.reload_plugin
-自动触发本插件重载，使新前缀立即生效。
+[架构]
+- 内置命令（添加/删除/列表/删全局）用 @Command 注册，pattern 是精确的"前缀+关键字"
+  (如 ``^\\.列表$``)。get_components() 把 pattern 中的 [^\\w\\s] 占位重写为
+  re.escape(prefix)，让 Runner 注册的正则只匹配实际配置的前缀。
+- 动态触发（用户 add 的 .xxx）走 @HookHandler 接管 chat.receive.after_process，
+  在 Command 调度前介入：命中已注册 trigger 才回复 + abort；未命中直接放行，
+  避免抢占其他插件的 Command。早期版本用贪婪 @Command (^{prefix}.+$) 注册
+  trigger 是 first-match-wins 的命令路由地雷，已彻底替换。
+
 """
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
+from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 from pydantic import model_validator
 
 import asyncio
@@ -24,11 +27,28 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-logger = logging.getLogger("plugin.custom_commands")
+logger = logging.getLogger(__name__)
 
 # --- 常量 ---
 
-PLUGIN_VERSION = "2.2.5"
+def _load_manifest_version() -> str:
+    """从 _manifest.json 读取版本号，保持插件元数据单一来源。"""
+    try:
+        manifest_path = Path(__file__).parent / "_manifest.json"
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        version = data.get("version")
+        if isinstance(version, str) and version.strip():
+            return version.strip()
+        logger.warning(
+            "_manifest.json 中 version 字段缺失或非法 (%r)，回落到 0.0.0", version,
+        )
+    except Exception:
+        logger.warning("读取 _manifest.json 失败，回落到 0.0.0", exc_info=True)
+    return "0.0.0"
+
+
+PLUGIN_VERSION = _load_manifest_version()
+CONFIG_SCHEMA_VERSION = "2.4.0"
 DEFAULT_MAX_TRIGGER_LENGTH = 50           # 触发词默认最大长度
 DEFAULT_MAX_RESPONSE_LENGTH = 2000        # 回复内容默认最大长度
 DEFAULT_MAX_COMMANDS_PER_SCOPE = 500      # 每个作用域默认最大命令数
@@ -40,7 +60,123 @@ IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 PREFIX_PLACEHOLDER = r"[^\w\s]"
 
 
+# --- 作用域解析 ---
+
+
+class ScopeResolver:
+    """群组作用域解析器：集中管理 group_scopes 的解析、反向索引、当前 scope 解析。
+
+    替代曾经散在 5 处的逻辑：
+        * ``SettingsSection._migrate_legacy_group_scopes`` —— 旧 dict 格式迁移
+        * ``CustomCommandsPlugin._parse_group_scopes`` + ``_refresh_group_scopes_cache``
+        * ``CommandDataManager._build_reverse_map`` + ``rebuild_reverse_map`` + ``resolve_scope``
+
+    每个调用方需要"当前 scope_id 应落到哪个数据分区"时，只调 ``resolve(scope_id)``。
+    新增扩展（按平台隔离、DM scope 等）只动这一个类。
+    """
+
+    def __init__(self) -> None:
+        self._group_scopes: Dict[str, List[str]] = {}
+        self._reverse_map: Dict[str, str] = {}
+        self._enable_isolation: bool = False
+
+    # ----- 配置层入口（pydantic model_validator 调用）-----
+
+    @staticmethod
+    def migrate_legacy(data: Any) -> Any:
+        """旧 dict 格式 group_scopes 转 List[str]；同时清洗每条两端的成对引号。"""
+        if not isinstance(data, dict):
+            return data
+        legacy = data.get("group_scopes")
+        if isinstance(legacy, dict):
+            converted: List[str] = []
+            for name, ids in legacy.items():
+                if not isinstance(ids, (list, tuple)):
+                    continue
+                ids_str = ",".join(str(item).strip() for item in ids if str(item).strip())
+                if str(name).strip() and ids_str:
+                    converted.append(f"{str(name).strip()}:{ids_str}")
+            data["group_scopes"] = converted
+        elif isinstance(legacy, list):
+            cleaned: List[str] = []
+            for item in legacy:
+                if not isinstance(item, str):
+                    continue
+                stripped = ScopeResolver._strip_paired_quotes(item.strip())
+                if stripped:
+                    cleaned.append(stripped)
+            data["group_scopes"] = cleaned
+        return data
+
+    @staticmethod
+    def _strip_paired_quotes(text: str) -> str:
+        """循环剥掉字符串两端的成对引号（单/双），最多剥两层防御异常输入。"""
+        result = text
+        for _ in range(2):
+            if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
+                result = result[1:-1].strip()
+            else:
+                break
+        return result
+
+    # ----- 解析 + 缓存重建 -----
+
+    @staticmethod
+    def parse(scopes: List[str]) -> Dict[str, List[str]]:
+        """将 List[str] 格式的 group_scopes 解析为 {作用域名: [群号]}。
+
+        每条字符串约定语法 ``"作用域名:群号1,群号2"``。
+        非法/空条目静默跳过；重复作用域名后者覆盖前者。
+        防御性剥掉外层成对引号，防止用户照旧示例输入时残留干扰解析。
+        """
+        result: Dict[str, List[str]] = {}
+        for entry in scopes or []:
+            if not isinstance(entry, str):
+                continue
+            cleaned = ScopeResolver._strip_paired_quotes(entry.strip())
+            if ":" not in cleaned:
+                continue
+            name, _, ids_part = cleaned.partition(":")
+            name = name.strip()
+            if not name:
+                continue
+            group_ids = [g.strip() for g in ids_part.split(",") if g.strip()]
+            if group_ids:
+                result[name] = group_ids
+        return result
+
+    def refresh(self, *, group_scopes: List[str], enable_isolation: bool) -> None:
+        """重建解析缓存与反向索引；on_load 与 on_config_update 时调用。"""
+        self._group_scopes = self.parse(group_scopes)
+        self._reverse_map = {
+            str(gid): scope_name
+            for scope_name, gids in self._group_scopes.items()
+            for gid in gids
+        }
+        self._enable_isolation = enable_isolation
+
+    # ----- 当前 scope 解析（运行时热路径）-----
+
+    def resolve(self, scope_id: str) -> str:
+        """解析当前 ID 对应的数据作用域。
+
+        优先级：group_scopes 映射 > 群组隔离 > global
+
+        - 命中 group_scopes 映射 → 使用映射的作用域名（不受隔离开关影响）
+        - 未命中 + 隔离开启 → 使用 scope_id 自身
+        - 未命中 + 隔离关闭 → 使用 ``"global"``
+
+        用 ``refresh()`` 预构建的 ``_reverse_map`` 做 O(1) 查找。
+        """
+        scope_id_str = str(scope_id)
+        mapped = self._reverse_map.get(scope_id_str)
+        if mapped is not None:
+            return mapped
+        return scope_id_str if self._enable_isolation else "global"
+
+
 # --- 配置模型 ---
+
 
 class PluginSection(PluginConfigBase):
     """插件基本配置。"""
@@ -52,13 +188,8 @@ class PluginSection(PluginConfigBase):
         description="插件名称",
         json_schema_extra={"disabled": True}
     )
-    version: str = Field(
-        default=PLUGIN_VERSION,
-        description="插件版本",
-        json_schema_extra={"disabled": True}
-    )
     config_version: str = Field(
-        default=PLUGIN_VERSION,
+        default=CONFIG_SCHEMA_VERSION,
         description="配置文件版本",
         json_schema_extra={"disabled": True}
     )
@@ -76,7 +207,14 @@ class SettingsSection(PluginConfigBase):
 
     command_prefix: str = Field(
         default=".",
-        description="所有自定义命令的前缀",
+        min_length=1,
+        max_length=1,
+        pattern=r"^[^\w\s]$",
+        description=(
+            "所有自定义命令的前缀，必须是单个非字母数字、非空白字符（如 . ! / 等）。"
+            "空 prefix 会让 startswith 总命中、字母数字 prefix 会让 Command pattern 中的 "
+            "[^\\w\\s] 占位永远失配——两类异常值都会让整个命令体系失灵，因此在配置层强约束。"
+        ),
         json_schema_extra={"label": "命令前缀", "hint": "如 . 或 ! 或 /"},
     )
     admin_user_ids: List[str] = Field(
@@ -136,40 +274,10 @@ class SettingsSection(PluginConfigBase):
     @classmethod
     def _migrate_legacy_group_scopes(cls, data: Any) -> Any:
         """兼容旧 dict 格式 group_scopes，并清洗每条两端可能多余的引号。
-        """
-        if not isinstance(data, dict):
-            return data
-        legacy = data.get("group_scopes")
-        if isinstance(legacy, dict):
-            converted: List[str] = []
-            for name, ids in legacy.items():
-                if not isinstance(ids, (list, tuple)):
-                    continue
-                ids_str = ",".join(str(item).strip() for item in ids if str(item).strip())
-                if str(name).strip() and ids_str:
-                    converted.append(f"{str(name).strip()}:{ids_str}")
-            data["group_scopes"] = converted
-        elif isinstance(legacy, list):
-            cleaned: List[str] = []
-            for item in legacy:
-                if not isinstance(item, str):
-                    continue
-                stripped = cls._strip_paired_quotes(item.strip())
-                if stripped:
-                    cleaned.append(stripped)
-            data["group_scopes"] = cleaned
-        return data
 
-    @staticmethod
-    def _strip_paired_quotes(text: str) -> str:
-        """循环剥掉字符串两端的成对引号（单/双），最多剥两层防御异常输入。"""
-        result = text
-        for _ in range(2):
-            if len(result) >= 2 and result[0] == result[-1] and result[0] in ('"', "'"):
-                result = result[1:-1].strip()
-            else:
-                break
-        return result
+        实现委托给 ``ScopeResolver.migrate_legacy``，与运行时解析共享同一份逻辑。
+        """
+        return ScopeResolver.migrate_legacy(data)
 
 
 class CustomCommandsConfig(PluginConfigBase):
@@ -182,7 +290,10 @@ class CustomCommandsConfig(PluginConfigBase):
 # --- 数据管理器 ---
 
 class CommandDataManager:
-    """自定义命令数据的加载、保存和查询。支持多作用域管理。
+    """自定义命令数据的加载、保存和查询。**只关心已解析的作用域名 + 数据**。
+
+    作用域解析（group_scopes / 隔离开关 → 当前 scope 名）由 ``ScopeResolver``
+    在调用方完成；本类不再持有任何反向索引或隔离配置。
 
     所有写操作通过 asyncio.Lock 保护，防止并发数据竞争。
     文件写入使用"临时文件 + 原子重命名"模式，防止崩溃导致数据损坏。
@@ -192,7 +303,6 @@ class CommandDataManager:
         self.commands: Dict[str, Dict[str, str]] = {}
         self.file_path: Optional[Path] = None
         self._lock = asyncio.Lock()
-        self._reverse_map: Dict[str, str] = {}  # 群号 → 作用域名 的反向索引缓存
 
     def load(self, plugin_dir: str) -> None:
         """加载命令数据文件，包含深层数据校验。"""
@@ -258,63 +368,31 @@ class CommandDataManager:
         """持久化命令数据到 JSON 文件（异步版本，避免阻塞事件循环）。"""
         await asyncio.to_thread(self._save_sync)
 
-    def rebuild_reverse_map(self, group_scopes: Dict[str, List[str]]) -> None:
-        """重建反向索引缓存。在配置加载或热重载时调用。"""
-        self._reverse_map = self._build_reverse_map(group_scopes)
+    async def save_locked(self) -> None:
+        """加锁后再保存——on_unload 收尾用。
 
-    def resolve_scope(self, scope_id: str, enable_isolation: bool,
-                      group_scopes: Dict[str, List[str]]) -> str:
-        """解析当前 ID 对应的数据作用域。
-
-        优先级：group_scopes 映射 > 群组隔离 > global
-
-        - 命中 group_scopes 映射 → 使用映射的作用域名（不受隔离开关影响）
-        - 未命中 + 隔离开启 → 使用 scope_id 自身作为作用域
-        - 未命中 + 隔离关闭 → 使用 global
-
-        这样可同时支持四种用法：
-          1) isolation=False + 空 scopes → 全部 global
-          2) isolation=False + 非空 scopes → 默认 global，指定群共享独立小圈子
-          3) isolation=True  + 空 scopes → 每群独立 scope
-          4) isolation=True  + 非空 scopes → 命中映射用映射，未命中各自独立
-
-        使用 rebuild_reverse_map() 预构建的缓存进行 O(1) 查找。
+        与 add/delete 共享同一把 ``_lock``，避免插件卸载时的最终 save 与
+        正在进行中的 add/delete 写操作 race 同一份 ``self.commands``。
         """
-        scope_id_str = str(scope_id)
-        mapped = self._reverse_map.get(scope_id_str)
-        if mapped is not None:
-            return mapped
-        return scope_id_str if enable_isolation else "global"
+        async with self._lock:
+            await self.save()
 
-    @staticmethod
-    def _build_reverse_map(group_scopes: Dict[str, List[str]]) -> Dict[str, str]:
-        """将 {作用域名: [群号列表]} 转换为 {群号: 作用域名} 的反向索引。"""
-        reverse: Dict[str, str] = {}
-        for scope_name, group_ids in group_scopes.items():
-            for gid in group_ids:
-                reverse[str(gid)] = scope_name
-        return reverse
-
-    def get(self, trigger: str, scope_id: str, enable_isolation: bool,
-            group_scopes: Dict[str, List[str]]) -> Optional[str]:
-        """获取命令回复（优先当前 Scope，回退 global）。"""
-        target_scope = self.resolve_scope(scope_id, enable_isolation, group_scopes)
-        if target_scope in self.commands and trigger in self.commands[target_scope]:
-            return self.commands[target_scope][trigger]
-        if target_scope != "global" and "global" in self.commands and trigger in self.commands["global"]:
+    def get(self, trigger: str, scope: str) -> Optional[str]:
+        """获取命令回复（优先指定 scope，回退 global）。"""
+        if scope in self.commands and trigger in self.commands[scope]:
+            return self.commands[scope][trigger]
+        if scope != "global" and "global" in self.commands and trigger in self.commands["global"]:
             return self.commands["global"][trigger]
         return None
 
-    async def add(self, trigger: str, response: str, scope_id: str,
-                  enable_isolation: bool, group_scopes: Dict[str, List[str]],
-                  max_per_scope: int = DEFAULT_MAX_COMMANDS_PER_SCOPE) -> str:
-        """添加命令到计算出的作用域（带并发锁和数量上限）。
+    async def add(self, trigger: str, response: str, scope: str,
+                  max_per_scope: int = DEFAULT_MAX_COMMANDS_PER_SCOPE) -> None:
+        """添加命令到指定作用域（带并发锁和数量上限）。
 
         Raises:
             ValueError: 当作用域命令数达到上限时抛出。
         """
         async with self._lock:
-            scope = self.resolve_scope(scope_id, enable_isolation, group_scopes)
             if scope not in self.commands:
                 self.commands[scope] = {}
             # 检查命令数量上限（更新已有命令不受限制）
@@ -327,20 +405,17 @@ class CommandDataManager:
                 )
             self.commands[scope][trigger] = response
             await self.save()
-            return scope
 
-    async def delete(self, trigger: str, scope_id: str, enable_isolation: bool,
-                     group_scopes: Dict[str, List[str]]) -> Tuple[bool, str]:
-        """从当前作用域删除命令（带并发锁）。"""
+    async def delete(self, trigger: str, scope: str) -> bool:
+        """从指定作用域删除命令（带并发锁）。返回是否真的删除。"""
         async with self._lock:
-            scope = self.resolve_scope(scope_id, enable_isolation, group_scopes)
             if scope in self.commands and trigger in self.commands[scope]:
                 del self.commands[scope][trigger]
                 if not self.commands[scope] and scope != "global":
                     del self.commands[scope]
                 await self.save()
-                return True, scope
-            return False, scope
+                return True
+            return False
 
     async def delete_global(self, trigger: str) -> bool:
         """直接从 global 作用域删除命令（带并发锁）。"""
@@ -351,15 +426,17 @@ class CommandDataManager:
                 return True
             return False
 
-    def get_triggers_for_scope(self, scope_id: str, enable_isolation: bool,
-                               group_scopes: Dict[str, List[str]]) -> List[str]:
-        """获取当前环境下可见的所有触发词（本群独有 + 全局共享），已排序。"""
+    def has_global(self, trigger: str) -> bool:
+        """global 作用域是否存在某个 trigger（提示消息用，避免外部窥探 commands dict）。"""
+        return "global" in self.commands and trigger in self.commands["global"]
+
+    def get_triggers_for_scope(self, scope: str) -> List[str]:
+        """获取指定作用域下可见的所有触发词（本域独有 + global 共享），已排序。"""
         triggers: set[str] = set()
         if "global" in self.commands:
             triggers.update(self.commands["global"].keys())
-        target_scope = self.resolve_scope(scope_id, enable_isolation, group_scopes)
-        if target_scope in self.commands:
-            triggers.update(self.commands[target_scope].keys())
+        if scope in self.commands:
+            triggers.update(self.commands[scope].keys())
         return sorted(triggers)
 
 
@@ -377,51 +454,23 @@ class CustomCommandsPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._data_manager = CommandDataManager()
+        self._scope_resolver = ScopeResolver()
         self._plugin_dir: str = ""
         self._admin_set: set[str] = set()  # 缓存管理员集合
-        self._group_scopes_cache: Dict[str, List[str]] = {}  # 解析后的群组映射缓存
         self._registered_prefix: Optional[str] = None  # 注册到主程序时使用的 prefix，用于检测热改
         self._self_reload_scheduled: bool = False  # 标记是否已调度自重载任务，防重入
-
-    @staticmethod
-    def _parse_group_scopes(scopes: List[str]) -> Dict[str, List[str]]:
-        """将 List[str] 格式的 group_scopes 解析为 {作用域名: [群号]}。
-
-        每条字符串约定语法 "作用域名:群号1,群号2"。
-        非法/空条目静默跳过，重复作用域名后者覆盖前者。
-        防御性剥掉外层成对引号，防止用户照旧示例输入时残留干扰解析。
-        """
-        result: Dict[str, List[str]] = {}
-        for entry in scopes or []:
-            if not isinstance(entry, str):
-                continue
-            cleaned = SettingsSection._strip_paired_quotes(entry.strip())
-            if ":" not in cleaned:
-                continue
-            name, _, ids_part = cleaned.partition(":")
-            name = name.strip()
-            if not name:
-                continue
-            group_ids = [g.strip() for g in ids_part.split(",") if g.strip()]
-            if group_ids:
-                result[name] = group_ids
-        return result
-
-    def _refresh_group_scopes_cache(self) -> None:
-        """刷新群组映射解析缓存，应在配置加载与热重载时调用。"""
-        self._group_scopes_cache = self._parse_group_scopes(self.config.settings.group_scopes)
 
     def get_components(self) -> List[Dict[str, Any]]:
         """重写组件收集：将 Command pattern 里的前缀占位符替换为实际配置的前缀。
 
-        主程序的命令分发是"第一个 pattern 命中即独占"，handler 内部返回 False
-        无法让分发器去尝试下一个 handler。若本插件的 Command pattern 用通配占位
-        ([^\\w\\s]) 注册，会贪婪地"吃掉"任何"符号+任意内容"的消息，导致其他
-        插件（例如 .余额 / .ddl 等）永远无法被路由到。
-
-        在此把占位符重写成 re.escape(prefix)，使注册的正则只匹配实际配置的前缀，
-        彻底回避跨插件抢匹配。同时由于 set_plugin_config() 调用在
+        装饰器声明阶段无法读 self.config.settings.command_prefix，所以 pattern 里
+        先用 [^\\w\\s] 占位（PREFIX_PLACEHOLDER），在此把占位重写成 re.escape(prefix)，
+        让 Runner 注册的正则只匹配实际配置的前缀，避免与其他插件的命令在
+        "第一个命中独占"的分发逻辑下相互抢匹配。set_plugin_config() 在
         get_components() 之前完成，self.config 在此处已经可用。
+
+        动态触发（用户 add 的 .xxx）不在这里注册——见类 docstring 中 @HookHandler
+        chat.receive.after_process 的设计。这里只处理 4 个精确 pattern 的 @Command。
 
         热重载场景：主程序在 on_config_update 后不会重新调用 get_components；
         on_config_update 检测到 prefix 变化时会通过 ctx.component.reload_plugin
@@ -431,9 +480,6 @@ class CustomCommandsPlugin(MaiBotPlugin):
         try:
             prefix = self.config.settings.command_prefix
         except Exception:
-            return components
-
-        if not prefix:
             return components
 
         escaped_prefix = re.escape(prefix)
@@ -457,11 +503,11 @@ class CustomCommandsPlugin(MaiBotPlugin):
         # 加载命令数据
         self._data_manager.load(self._plugin_dir)
 
-        # 解析并缓存群组映射
-        self._refresh_group_scopes_cache()
-
-        # 构建反向索引缓存
-        self._data_manager.rebuild_reverse_map(self._group_scopes_cache)
+        # 刷新作用域解析器（解析 group_scopes + 反向索引）
+        self._scope_resolver.refresh(
+            group_scopes=self.config.settings.group_scopes,
+            enable_isolation=self.config.settings.enable_group_isolation,
+        )
 
         # 缓存管理员集合
         self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
@@ -475,8 +521,12 @@ class CustomCommandsPlugin(MaiBotPlugin):
         logger.info("自定义命令插件(v%s)初始化完成。", PLUGIN_VERSION)
 
     async def on_unload(self) -> None:
-        """插件卸载时执行最终保存。"""
-        await self._data_manager.save()
+        """插件卸载时执行最终保存。
+
+        走 ``save_locked``——与并发进行中的 add/delete 互斥，避免最终保存与
+        正在写入的命令同时操作 ``self.commands`` 造成数据不一致。
+        """
+        await self._data_manager.save_locked()
         logger.info("自定义命令插件已卸载。")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
@@ -484,10 +534,11 @@ class CustomCommandsPlugin(MaiBotPlugin):
         if scope == "self":
             # 刷新管理员缓存
             self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
-            # 刷新群组映射解析缓存
-            self._refresh_group_scopes_cache()
-            # 刷新反向索引缓存
-            self._data_manager.rebuild_reverse_map(self._group_scopes_cache)
+            # 刷新作用域解析器
+            self._scope_resolver.refresh(
+                group_scopes=self.config.settings.group_scopes,
+                enable_isolation=self.config.settings.enable_group_isolation,
+            )
             # 图片目录可能被修改，确保新目录存在
             try:
                 self._resolve_image_dir().mkdir(parents=True, exist_ok=True)
@@ -511,33 +562,44 @@ class CustomCommandsPlugin(MaiBotPlugin):
 
         必须先把控制权交回事件循环，让本次 on_config_update 完整返回，再发起 reload，
         否则当前协程会与即将到来的 on_unload 串行执行而存在死锁风险。
+
+        所有失败路径都必须复位 ``_self_reload_scheduled``，否则用户后续再改 prefix
+        无法触发 reload；成功路径不复位——reload 完成后旧实例即将被 GC，flag 状态无关紧要。
         """
         await asyncio.sleep(0)
-        plugin_id = ""
+        success = False
         try:
-            plugin_id = self.ctx.plugin_id
-        except Exception as exc:
-            logger.error("命令前缀变更后无法获取 plugin_id：%s；请手动重载插件让新前缀生效", exc)
-            return
+            plugin_id = ""
+            try:
+                plugin_id = self.ctx.plugin_id
+            except Exception as exc:
+                logger.error("命令前缀变更后无法获取 plugin_id：%s；请手动重载插件让新前缀生效", exc)
+                return
 
-        logger.info(
-            "检测到命令前缀已从 %r 修改为 %r，正在自动重载插件 %s 让新前缀生效",
-            old_prefix, new_prefix, plugin_id,
-        )
-        try:
-            result = await self.ctx.component.reload_plugin(plugin_id)
-        except Exception as exc:
-            logger.error(
-                "自动重载插件 %s 失败：%s；请在插件管理器中手动重载使新前缀生效",
-                plugin_id, exc, exc_info=True,
+            logger.info(
+                "检测到命令前缀已从 %r 修改为 %r，正在自动重载插件 %s 让新前缀生效",
+                old_prefix, new_prefix, plugin_id,
             )
-            return
+            try:
+                result = await self.ctx.component.reload_plugin(plugin_id)
+            except Exception as exc:
+                logger.error(
+                    "自动重载插件 %s 失败：%s；请在插件管理器中手动重载使新前缀生效",
+                    plugin_id, exc, exc_info=True,
+                )
+                return
 
-        if isinstance(result, dict) and not result.get("success", True):
-            logger.error(
-                "自动重载插件 %s 失败：%s；请在插件管理器中手动重载使新前缀生效",
-                plugin_id, result.get("error", "未知错误"),
-            )
+            if isinstance(result, dict) and not result.get("success", True):
+                logger.error(
+                    "自动重载插件 %s 失败：%s；请在插件管理器中手动重载使新前缀生效",
+                    plugin_id, result.get("error", "未知错误"),
+                )
+                return
+
+            success = True
+        finally:
+            if not success:
+                self._self_reload_scheduled = False
 
     # ===== 权限与作用域辅助方法 =====
 
@@ -579,6 +641,32 @@ class CustomCommandsPlugin(MaiBotPlugin):
             return None
         return image_path
 
+    @staticmethod
+    def _read_and_encode_image_sync(
+        image_path: Path, max_size: int,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """同步读图片并 base64 编码；返回 (b64_data, error)。
+
+        在异步路径上必须通过 ``asyncio.to_thread`` 调用——10MB 级别的
+        ``read_bytes`` + ``base64.b64encode`` 在事件循环上会阻塞 100ms+。
+
+        Returns:
+            (base64 字符串, None) 成功；
+            (None, "OVERSIZE:{file_size}") 文件超过 max_size，调用方据此分流出友好错误；
+            (None, 其它人类可读字符串) 其它 I/O 失败描述。
+        """
+        try:
+            file_size = image_path.stat().st_size
+        except OSError as e:
+            return None, f"读取图片文件信息失败: {e}"
+        if file_size > max_size:
+            return None, f"OVERSIZE:{file_size}"
+        try:
+            data = image_path.read_bytes()
+        except OSError as e:
+            return None, f"读取图片失败: {e}"
+        return base64.b64encode(data).decode("utf-8"), None
+
     def _build_list_header_text(self, scope_id: str, current_scope: str) -> str:
         """构造列表头部文本。"""
         header_text = f"📋 自定义命令列表\n当前ID: {scope_id}\n对应作用域: {current_scope}"
@@ -618,15 +706,15 @@ class CustomCommandsPlugin(MaiBotPlugin):
 
     @staticmethod
     def _get_forward_api_error(api_result: Any) -> Optional[str]:
-        """提取 Napcat 合并转发 API 的失败信息。"""
+        """提取 Napcat 合并转发 API 的失败信息。
+
+        NapCat 业务失败由 adapter raise → Host _cap_api_call 包装为 success=False，
+        原始 NapCat 响应（status / wording 字段）不会出现在 plugin 端。
+        """
         if not isinstance(api_result, dict):
             return None
         if api_result.get("success") is False:
             return str(api_result.get("error") or "Napcat 合并转发调用失败")
-
-        status = str(api_result.get("status") or "").lower()
-        if status and status != "ok":
-            return str(api_result.get("wording") or api_result.get("message") or "Napcat 合并转发调用失败")
         return None
 
     async def _send_list_as_forward(self, header_text: str, list_content: str,
@@ -690,13 +778,13 @@ class CustomCommandsPlugin(MaiBotPlugin):
                          plugin_config: Optional[dict] = None, **kwargs):
         """添加命令：<前缀>问：触发词答：回复内容"""
         if not self._check_prefix(text):
-            return False, None, False
+            return False, None, 0
         if not matched_groups:
-            return False, "缺少匹配参数", True
+            return False, "缺少匹配参数", 1
 
         if not self._check_admin(user_id):
             await self.ctx.send.text("❌ 你没有权限执行此管理员命令", stream_id)
-            return False, "用户 %s 无权限" % user_id, True
+            return False, "用户 %s 无权限" % user_id, 1
 
         trigger = matched_groups.get("trigger", "").strip()
         response = matched_groups.get("response", "").strip()
@@ -706,39 +794,38 @@ class CustomCommandsPlugin(MaiBotPlugin):
             await self.ctx.send.text(
                 f"❌ 命令格式错误，请使用：{prefix}问：触发词答：回复内容", stream_id,
             )
-            return False, "格式错误", True
+            return False, "格式错误", 1
 
         # 输入长度校验
         if len(trigger) > self.config.settings.max_trigger_length:
             await self.ctx.send.text(
                 f"❌ 触发词过长（最多 {self.config.settings.max_trigger_length} 字符）", stream_id,
             )
-            return False, "触发词过长", True
+            return False, "触发词过长", 1
         if len(response) > self.config.settings.max_response_length:
             await self.ctx.send.text(
                 f"❌ 回复内容过长（最多 {self.config.settings.max_response_length} 字符）", stream_id,
             )
-            return False, "回复内容过长", True
+            return False, "回复内容过长", 1
 
         # 图片路径安全校验：在写入前拒绝含路径穿越的回复内容
         if response.lower().endswith(IMAGE_EXTENSIONS):
             if self._resolve_safe_image_path(response) is None:
                 logger.warning("添加命令时检测到路径穿越尝试: '%s'", response)
                 await self.ctx.send.text("❌ 图片路径不合法，不允许包含路径穿越", stream_id)
-                return False, "路径穿越被阻止", True
+                return False, "路径穿越被阻止", 1
 
         scope_id = self._get_scope_id(group_id, user_id)
-        isolation = self.config.settings.enable_group_isolation
-        group_scopes = self._group_scopes_cache
+        scope_used = self._scope_resolver.resolve(scope_id)
 
         try:
-            scope_used = await self._data_manager.add(
-                trigger, response, scope_id, isolation, group_scopes,
+            await self._data_manager.add(
+                trigger, response, scope_used,
                 max_per_scope=self.config.settings.max_commands_per_scope,
             )
         except ValueError as exc:
             await self.ctx.send.text(f"❌ {exc}", stream_id)
-            return False, "命令数量超限", True
+            return False, "命令数量超限", 1
 
         if scope_used == "global":
             scope_desc = "（全局共享）"
@@ -752,7 +839,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
             stream_id,
         )
         logger.info("用户 '%s' 在作用域 '%s' 添加命令: '%s'", user_id, scope_used, trigger)
-        return True, "添加成功", True
+        return True, "添加成功", 1
 
     @Command(
         "custom_command_delete",
@@ -765,42 +852,37 @@ class CustomCommandsPlugin(MaiBotPlugin):
                             plugin_config: Optional[dict] = None, **kwargs):
         """删除命令：<前缀>删：触发词"""
         if not self._check_prefix(text):
-            return False, None, False
+            return False, None, 0
         if not matched_groups:
-            return False, "缺少匹配参数", True
+            return False, "缺少匹配参数", 1
 
         if not self._check_admin(user_id):
             await self.ctx.send.text("❌ 你没有权限执行此管理员命令", stream_id)
-            return False, "用户 %s 无权限" % user_id, True
+            return False, "用户 %s 无权限" % user_id, 1
 
         trigger = matched_groups.get("trigger", "").strip()
         scope_id = self._get_scope_id(group_id, user_id)
-        isolation = self.config.settings.enable_group_isolation
-        group_scopes = self._group_scopes_cache
-        success, scope_used = await self._data_manager.delete(
-            trigger, scope_id, isolation, group_scopes,
-        )
+        current_scope = self._scope_resolver.resolve(scope_id)
+        success = await self._data_manager.delete(trigger, current_scope)
 
         if success:
             await self.ctx.send.text(
-                f"✅ 成功删除了自定义命令（作用域: {scope_used}）：'{trigger}'",
+                f"✅ 成功删除了自定义命令（作用域: {current_scope}）：'{trigger}'",
                 stream_id,
             )
-            return True, "删除成功", True
+            return True, "删除成功", 1
 
-        current_scope = self._data_manager.resolve_scope(scope_id, isolation, group_scopes)
         msg = f"❌ 未在当前作用域 [{current_scope}] 找到命令：'{trigger}'"
 
         if (
             current_scope != "global"
-            and "global" in self._data_manager.commands
-            and trigger in self._data_manager.commands["global"]
+            and self._data_manager.has_global(trigger)
         ):
             prefix = self.config.settings.command_prefix
             msg += f"\n💡 提示：这是一个【全局命令】。可使用 {prefix}删全局：{trigger} 来删除。"
 
         await self.ctx.send.text(msg, stream_id)
-        return False, "命令未找到", True
+        return False, "命令未找到", 1
 
     @Command(
         "custom_command_delete_global",
@@ -813,13 +895,13 @@ class CustomCommandsPlugin(MaiBotPlugin):
                                    plugin_config: Optional[dict] = None, **kwargs):
         """删除全局命令：<前缀>删全局：触发词"""
         if not self._check_prefix(text):
-            return False, None, False
+            return False, None, 0
         if not matched_groups:
-            return False, "缺少匹配参数", True
+            return False, "缺少匹配参数", 1
 
         if not self._check_admin(user_id):
             await self.ctx.send.text("❌ 你没有权限执行此管理员命令", stream_id)
-            return False, "用户 %s 无权限" % user_id, True
+            return False, "用户 %s 无权限" % user_id, 1
 
         trigger = matched_groups.get("trigger", "").strip()
         success = await self._data_manager.delete_global(trigger)
@@ -829,10 +911,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
                 f"✅ 成功删除了全局自定义命令：'{trigger}'", stream_id,
             )
             logger.info("用户 '%s' 删除全局命令: '%s'", user_id, trigger)
-            return True, "全局删除成功", True
+            return True, "全局删除成功", 1
 
         await self.ctx.send.text(f"❌ 未在全局作用域找到命令：'{trigger}'", stream_id)
-        return False, "全局命令未找到", True
+        return False, "全局命令未找到", 1
 
     @Command(
         "custom_command_list",
@@ -845,13 +927,11 @@ class CustomCommandsPlugin(MaiBotPlugin):
                           **kwargs):
         """列出命令：<前缀>列表"""
         if not self._check_prefix(text):
-            return False, None, False
+            return False, None, 0
 
         scope_id = self._get_scope_id(group_id, user_id)
-        isolation = self.config.settings.enable_group_isolation
-        group_scopes = self._group_scopes_cache
-        triggers = self._data_manager.get_triggers_for_scope(scope_id, isolation, group_scopes)
-        current_scope = self._data_manager.resolve_scope(scope_id, isolation, group_scopes)
+        current_scope = self._scope_resolver.resolve(scope_id)
+        triggers = self._data_manager.get_triggers_for_scope(current_scope)
         prefix = self.config.settings.command_prefix
 
         if not triggers:
@@ -871,92 +951,141 @@ class CustomCommandsPlugin(MaiBotPlugin):
             except ValueError as exc:
                 logger.error("发送命令列表时目标 ID 非法: %s", exc)
                 await self.ctx.send.text(f"❌ 发送命令列表失败：{exc}", stream_id)
-                return False, "列表发送失败", True
+                return False, "列表发送失败", 1
             except Exception as exc:
                 logger.error("发送命令列表时发生异常: %s", exc, exc_info=True)
                 await self.ctx.send.text("❌ 发送命令列表时发生内部错误", stream_id)
-                return False, "列表发送失败", True
+                return False, "列表发送失败", 1
 
             if forward_error:
                 logger.error("Napcat 合并转发发送失败: %s", forward_error)
                 await self.ctx.send.text(f"❌ 发送命令列表失败：{forward_error}", stream_id)
-                return False, "列表发送失败", True
+                return False, "列表发送失败", 1
 
-        return True, "列表已发送", True
+        return True, "列表已发送", 1
 
-    @Command(
-        "custom_command_trigger",
-        description="处理动态自定义命令（<前缀>触发词 → 查找并回复）",
-        pattern=r"^(?P<prefix>[^\w\s])(?P<trigger>.+)$",
+    # ===== 动态触发：HookHandler 路径 =====
+    # 改造历史：早期版本把动态触发也用 @Command(pattern=r"^{prefix}(?P<trigger>.+)$")
+    # 注册，主程序"第一个 pattern 命中即独占"的分发器会让本插件抢走所有"前缀+任意字符"
+    # 的消息，handler 查不到 trigger 时返回 (False, None, 0) 也不能让出——其他插件用
+    # 同 prefix 的命令（用户改 prefix = "/" 时与 llm-balance 的 ^/余额$ 冲突）会被
+    # 永久屏蔽。Hook 路径按 order 顺次执行，未 abort 就放行，彻底绕过 first-match-wins。
+
+    # 内置命令前缀集合——以这些片段开头的消息留给精确 pattern 的 @Command 处理
+    # （否则用户 add 名为"列表"/"问：x答：y"的 trigger 会与内置命令冲突）。
+    _RESERVED_TRIGGER_PREFIXES = ("问：", "删：", "删全局：")
+    _RESERVED_TRIGGER_EXACT = ("列表",)
+
+    @HookHandler(
+        "chat.receive.after_process",
+        name="custom_command_dynamic_dispatcher",
+        description="动态自定义命令分发：在 Command 调度前接管前缀消息，命中已注册 trigger 则回复+abort，未命中直接放行",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.EARLY,
+        timeout_ms=8000,
+        error_policy=ErrorPolicy.SKIP,
     )
-    async def handle_trigger(self, stream_id: str = "", group_id: str = "",
-                             user_id: str = "", text: str = "",
-                             matched_groups: Optional[dict] = None,
-                             plugin_config: Optional[dict] = None, **kwargs):
-        """动态触发命令：<前缀>触发词 → 查找并回复。"""
-        if not self._check_prefix(text):
-            return False, None, False
-        if not matched_groups:
-            return False, None, False
+    async def handle_dynamic_trigger(
+        self, message: Optional[dict] = None, **kwargs
+    ) -> Optional[Dict[str, Any]]:
+        """动态触发命令的 hook 入口。
 
-        trigger = matched_groups.get("trigger", "").strip()
+        返回 ``{"action": "abort"}`` 表示已处理 + 拦截后续主链；返回 ``None`` 放行
+        让消息继续走 Command 调度与 LLM 主链。任何"不该由本插件处理"的消息
+        （非群/私聊文本、不带前缀、命中内置命令、未注册 trigger）都必须返回 None。
+        """
+        if message is None or not isinstance(message, dict):
+            return None
+
+        text = str(message.get("processed_plain_text") or "")
+        if not text:
+            return None
+
+        try:
+            prefix = self.config.settings.command_prefix
+        except Exception:
+            return None
+        if not prefix or not text.startswith(prefix):
+            return None
+
+        trigger = text[len(prefix):].strip()
         if not trigger:
-            return False, None, False
+            return None
+
+        # 内置命令交给精确 pattern 的 @Command 处理，避免与同名动态 trigger 冲突
+        if trigger in self._RESERVED_TRIGGER_EXACT:
+            return None
+        if any(trigger.startswith(p) for p in self._RESERVED_TRIGGER_PREFIXES):
+            return None
+
+        msg_info = message.get("message_info") or {}
+        user_info = msg_info.get("user_info") or {}
+        group_info = msg_info.get("group_info") or {}
+        stream_id = str(message.get("session_id") or "")
+        group_id = str(group_info.get("group_id") or "")
+        user_id = str(user_info.get("user_id") or "")
+        if not stream_id:
+            return None
 
         scope_id = self._get_scope_id(group_id, user_id)
-        isolation = self.config.settings.enable_group_isolation
-        group_scopes = self._group_scopes_cache
-        response_value = self._data_manager.get(trigger, scope_id, isolation, group_scopes)
-
+        current_scope = self._scope_resolver.resolve(scope_id)
+        response_value = self._data_manager.get(trigger, current_scope)
         if response_value is None:
-            return False, None, False
+            return None
 
-        # 判断是否为图片回复
+        # 命中已注册 trigger：发送回复 + abort 后续主链（包括 Command 调度与 LLM）
         if response_value.lower().endswith(IMAGE_EXTENSIONS):
-            # 路径安全检查：防止路径穿越攻击（如 ../../etc/passwd）
-            image_path = self._resolve_safe_image_path(response_value)
-            if image_path is None:
-                logger.warning("检测到路径穿越尝试: '%s'", response_value)
-                await self.ctx.send.text("❌ 图片路径不合法", stream_id)
-                return False, "路径穿越被阻止", True
+            await self._dispatch_image_response(response_value, stream_id)
+        else:
+            await self.ctx.send.text(response_value, stream_id)
+        return {"action": "abort"}
 
-            if not image_path.exists():
-                # 仅向用户展示文件名，不泄露服务器内部路径
-                await self.ctx.send.text(
-                    f"❌ 找不到图片文件 '{response_value}'", stream_id,
-                )
-                logger.warning("图片文件不存在: %s", image_path)
-                return False, "图片文件不存在", True
+    async def _dispatch_image_response(self, response_value: str, stream_id: str) -> None:
+        """图片回复的完整链路：路径安全 → 大小校验 → 读盘编码 → 发送。
 
-            # 检查图片文件大小
-            try:
-                file_size = image_path.stat().st_size
-            except OSError as e:
-                logger.error("读取图片文件信息失败: %s", e)
-                await self.ctx.send.text("❌ 读取图片文件时发生错误", stream_id)
-                return False, "读取图片失败", True
+        所有失败路径都向用户回发错误文案——hook 已经决定 abort，错误也算"已处理"。
+        """
+        image_path = self._resolve_safe_image_path(response_value)
+        if image_path is None:
+            logger.warning("检测到路径穿越尝试: '%s'", response_value)
+            await self.ctx.send.text("❌ 图片路径不合法", stream_id)
+            return
 
-            max_image_size = self.config.settings.max_image_size
-            if file_size > max_image_size:
-                size_mb = file_size / (1024 * 1024)
+        if not image_path.exists():
+            # 仅向用户展示文件名，不泄露服务器内部路径
+            await self.ctx.send.text(
+                f"❌ 找不到图片文件 '{response_value}'", stream_id,
+            )
+            logger.warning("图片文件不存在: %s", image_path)
+            return
+
+        # 同步 I/O（stat + read + base64 编码）丢线程池跑，避免 10MB 级图片阻塞事件循环
+        max_image_size = self.config.settings.max_image_size
+        b64_img_data, encode_error = await asyncio.to_thread(
+            self._read_and_encode_image_sync, image_path, max_image_size,
+        )
+        if encode_error:
+            if encode_error.startswith("OVERSIZE:"):
+                try:
+                    actual_size = int(encode_error.split(":", 1)[1])
+                except ValueError:
+                    actual_size = 0
+                size_mb = actual_size / (1024 * 1024)
                 limit_mb = max_image_size / (1024 * 1024)
                 await self.ctx.send.text(
                     f"❌ 图片文件过大（{size_mb:.1f}MB，上限 {limit_mb:.0f}MB）",
                     stream_id,
                 )
-                return False, "图片文件过大", True
+                return
+            logger.error("读取图片失败: %s", encode_error)
+            await self.ctx.send.text("❌ 读取图片文件时发生错误", stream_id)
+            return
 
-            try:
-                b64_img_data = base64.b64encode(image_path.read_bytes()).decode("utf-8")
-                await self.ctx.send.image(b64_img_data, stream_id)
-            except Exception as e:
-                logger.error("发送动态图片失败: %s", e)
-                await self.ctx.send.text("❌ 发送图片时发生内部错误", stream_id)
-                return False, "发送图片失败", True
-        else:
-            await self.ctx.send.text(response_value, stream_id)
-
-        return True, "动态命令执行成功", True
+        try:
+            await self.ctx.send.image(b64_img_data, stream_id)
+        except Exception as e:
+            logger.error("发送动态图片失败: %s", e)
+            await self.ctx.send.text("❌ 发送图片时发生内部错误", stream_id)
 
 
 def create_plugin() -> CustomCommandsPlugin:
