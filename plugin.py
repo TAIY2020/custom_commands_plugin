@@ -55,6 +55,15 @@ DEFAULT_MAX_COMMANDS_PER_SCOPE = 500      # 每个作用域默认最大命令数
 DEFAULT_MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 图片文件默认最大 10MB
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
+
+def _looks_like_image_response(response: str) -> bool:
+    """裸文件名形式的图片回复检测——避免把"详情见 chart.png"这类含空格句子误判为图片协议。
+
+    README 约定的图片语法是 ``.问：xx答：hello.png``——即整个 response 就是一个文件名，
+    不带空格/换行。任何含空白字符的 response 都视为纯文本，即便以 ``.png`` 结尾。
+    """
+    return bool(response) and not any(c.isspace() for c in response) and response.lower().endswith(IMAGE_EXTENSIONS)
+
 # Command pattern 中前缀占位符——装饰器声明阶段无法访问 self.config，
 # 这里先用通配占位，get_components() 阶段再用 re.escape(配置前缀) 重写为精确匹配。
 PREFIX_PLACEHOLDER = r"[^\w\s]"
@@ -808,8 +817,18 @@ class CustomCommandsPlugin(MaiBotPlugin):
             )
             return False, "回复内容过长", 1
 
+        # 触发词命中 hook 的 reserved 列表时，写入会变成幽灵数据：
+        # hook 见到 `.<reserved>` 直接 return None 让给 @Command，动态分发永不触达。
+        if trigger in self._RESERVED_TRIGGER_EXACT or any(
+            trigger.startswith(p) for p in self._RESERVED_TRIGGER_PREFIXES
+        ):
+            await self.ctx.send.text(
+                f"❌ 触发词「{trigger}」与内置命令冲突，请换一个", stream_id,
+            )
+            return False, "触发词为保留词", 1
+
         # 图片路径安全校验：在写入前拒绝含路径穿越的回复内容
-        if response.lower().endswith(IMAGE_EXTENSIONS):
+        if _looks_like_image_response(response):
             if self._resolve_safe_image_path(response) is None:
                 logger.warning("添加命令时检测到路径穿越尝试: '%s'", response)
                 await self.ctx.send.text("❌ 图片路径不合法，不允许包含路径穿越", stream_id)
@@ -1034,7 +1053,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
             return None
 
         # 命中已注册 trigger：发送回复 + abort 后续主链（包括 Command 调度与 LLM）
-        if response_value.lower().endswith(IMAGE_EXTENSIONS):
+        if _looks_like_image_response(response_value):
             await self._dispatch_image_response(response_value, stream_id)
         else:
             await self.ctx.send.text(response_value, stream_id)
