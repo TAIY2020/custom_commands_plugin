@@ -37,5 +37,12 @@
       "zh-CN"
     ]
   },
+  "plugin_type": "tool",
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "./command.svg"
+    }
+  },
   "id": "TAIY2020.custom-commands-plugin"
 }
