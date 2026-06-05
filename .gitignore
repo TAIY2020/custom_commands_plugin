@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# 本地运行配置与用户数据
+config.toml
+custom_commands.json
+custom_commands.json.tmp
+images/
+
+# 常见本地杂项
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
