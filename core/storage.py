@@ -12,12 +12,17 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 from .common import DEFAULT_MAX_COMMANDS_PER_SCOPE
 
 logger = logging.getLogger(__name__)
+
+
+class DataProtectionError(RuntimeError):
+    """命令数据文件加载失败后进入保护模式，拒绝继续覆盖原文件。"""
 
 
 class CommandDataManager:
@@ -35,15 +40,29 @@ class CommandDataManager:
         self.file_path: Optional[Path] = None
         self._lock = asyncio.Lock()
         # 加载已存在文件时发生解析/读取失败 → True。此时内存被重置为空库，若再落盘会覆盖
-        # 用户原始（可能只是手工编辑出错、仍可修复）的数据，故卸载收尾的 save_locked 会跳过保存。
+        # 用户原始（可能只是手工编辑出错、仍可修复）的数据，故运行期写入与卸载保存都要拒绝。
         self._load_failed = False
+
+    @property
+    def is_protected(self) -> bool:
+        """命令数据是否因加载失败进入保护模式。"""
+        return self._load_failed
+
+    def _ensure_writable(self) -> None:
+        """保护模式下拒绝任何会覆盖 custom_commands.json 的写入。"""
+        if self._load_failed:
+            raise DataProtectionError(
+                "命令数据文件加载失败，已进入保护模式；"
+                "请先修复 custom_commands.json 后重载插件，再修改命令"
+            )
 
     def load(self, plugin_dir: str) -> None:
         """加载命令数据文件，包含深层数据校验。
 
-        已存在文件解析/读取失败时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，再置
-        ``_load_failed`` 并把内存设为空库；据此 ``save_locked``（on_unload 收尾）会跳过保存，
-        避免空库覆盖用户仅手工编辑出错、仍可原地修复的原始数据。
+        已存在文件解析/读取失败、或 JSON 能解析但结构语义异常（顶层非 dict、或任一作用域
+        非 dict/含非字符串键值）时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，再置
+        ``_load_failed``（结构异常时仍保留可识别的合法作用域到内存）；据此 ``save_locked``
+        （on_unload 收尾）会跳过保存，避免清洗/重置后的内存静默覆盖用户仍可手工修复的原始数据。
         """
         self.file_path = Path(plugin_dir) / "custom_commands.json"
         self._load_failed = False
@@ -73,23 +92,43 @@ class CommandDataManager:
             self.commands = {"global": {}}
             return
 
-        # 深层校验：必须是 Dict[str, Dict[str, str]]
+        # 深层校验：必须是 Dict[str, Dict[str, str]]。
+        # 关键：JSON 能解析但语义结构不符（顶层非 dict、或任一作用域非 dict/含非字符串键值）
+        # 时，同样视为"文件已非插件干净格式"——备份原文件并置 _load_failed，让 on_unload 的
+        # save_locked 跳过自动保存，避免用"清洗/重置后的版本"静默覆盖用户仍可手工修复的原始
+        # 数据（与 JSONDecodeError/OSError 分支同一保护语义；此前这里只 warning 不保护是隐患）。
         if not isinstance(data, dict):
-            logger.warning("命令数据格式异常（非字典），已重置为空")
+            logger.error(
+                "命令数据顶层结构异常（非字典），已备份原文件并进入保护模式，"
+                "卸载时将不会自动保存以免覆盖",
+            )
+            self._load_failed = True
+            self._backup_corrupt_file()
             self.commands = {"global": {}}
-        else:
-            validated: Dict[str, Dict[str, str]] = {}
-            for scope_key, scope_val in data.items():
-                if isinstance(scope_val, dict) and all(
-                    isinstance(k, str) and isinstance(v, str)
-                    for k, v in scope_val.items()
-                ):
-                    validated[scope_key] = scope_val
-                else:
-                    logger.warning("作用域 '%s' 数据格式异常，已跳过", scope_key)
-            self.commands = validated if validated else {"global": {}}
-            if "global" not in self.commands:
-                self.commands["global"] = {}
+            return
+
+        validated: Dict[str, Dict[str, str]] = {}
+        has_corrupt_scope = False
+        for scope_key, scope_val in data.items():
+            if isinstance(scope_val, dict) and all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in scope_val.items()
+            ):
+                validated[scope_key] = scope_val
+            else:
+                has_corrupt_scope = True
+                logger.warning("作用域 '%s' 数据格式异常，已跳过", scope_key)
+        # 任一作用域被判损坏：合法作用域仍载入内存供本次运行使用，但备份原文件并进入保护
+        # 模式，避免卸载自动保存时把损坏作用域从磁盘上静默抹掉（用户可能想手工修复它们）。
+        if has_corrupt_scope:
+            logger.error(
+                "部分作用域数据结构异常，已备份原文件并进入保护模式，卸载时将不会自动保存以免覆盖",
+            )
+            self._load_failed = True
+            self._backup_corrupt_file()
+        self.commands = validated if validated else {"global": {}}
+        if "global" not in self.commands:
+            self.commands["global"] = {}
         total_cmds = sum(len(scope) for scope in self.commands.values())
         logger.info(
             "成功加载 %d 条自定义命令 (涵盖 %d 个作用域)",
@@ -122,7 +161,11 @@ class CommandDataManager:
         """
         if not self.file_path:
             return
-        tmp_path = self.file_path.with_suffix(".json.tmp")
+        # 临时文件名加入随机后缀，避免热重载/跨实例并发保存时多个进程争用同一个固定 .tmp
+        # 导致写入交错损坏（与 images.py 图片落盘同一防御）。前缀 "." 让它在目录里不显眼。
+        tmp_path = self.file_path.with_name(
+            f".{self.file_path.name}.{uuid.uuid4().hex}.tmp"
+        )
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.commands, f, ensure_ascii=False, indent=4)
@@ -142,6 +185,7 @@ class CommandDataManager:
 
     async def save(self) -> None:
         """持久化命令数据到 JSON 文件（异步版本，避免阻塞事件循环）。"""
+        self._ensure_writable()
         await asyncio.to_thread(self._save_sync)
 
     async def save_locked(self) -> None:
@@ -181,6 +225,7 @@ class CommandDataManager:
             ValueError: 当作用域命令数达到上限时抛出。
         """
         async with self._lock:
+            self._ensure_writable()
             scope_created = scope not in self.commands
             if scope_created:
                 self.commands[scope] = {}
@@ -222,6 +267,7 @@ class CommandDataManager:
             第二项供调用方清理孤儿资源；仍被其他命令引用或未删除时为 None。
         """
         async with self._lock:
+            self._ensure_writable()
             if scope in self.commands and trigger in self.commands[scope]:
                 old_value = self.commands[scope][trigger]
                 del self.commands[scope][trigger]
@@ -247,6 +293,7 @@ class CommandDataManager:
             Tuple[bool, Optional[str]]: ``(是否真的删除, 删除后失去全部引用的旧回复内容)``。
         """
         async with self._lock:
+            self._ensure_writable()
             if "global" in self.commands and trigger in self.commands["global"]:
                 old_value = self.commands["global"][trigger]
                 del self.commands["global"][trigger]

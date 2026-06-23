@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import re
 from typing import TYPE_CHECKING, Optional, Tuple
 
 from .common import (
@@ -26,6 +27,7 @@ from .common import (
     looks_like_image_response,
     resolve_scope_id,
 )
+from .storage import DataProtectionError
 
 if TYPE_CHECKING:
     from ..plugin import CustomCommandsPlugin
@@ -140,6 +142,10 @@ class CommandService:
         except ValueError as exc:
             await self._send_text(f"❌ {exc}", stream_id, context="命令数量超限提示")
             return False, "命令数量超限", 1
+        except DataProtectionError as exc:
+            logger.warning("拒绝添加命令以保护损坏的数据文件: %s", exc)
+            await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+            return False, "数据保护模式", 1
         except OSError as exc:
             logger.error("保存命令数据失败: %s", exc, exc_info=True)
             await self._send_text(
@@ -163,12 +169,14 @@ class CommandService:
         return True, "添加成功", 1
 
     async def add_image(self, trigger: str, b64_data: str, url_hint: str,
-                        stream_id: str, group_id: str, user_id: str) -> Tuple[bool, str, int]:
+                        stream_id: str, group_id: str, user_id: str,
+                        ignored_image_count: int = 0) -> Tuple[bool, str, int]:
         """添加图片命令：把消息内图片落盘并绑定触发词。
 
         ``trigger`` / ``b64_data`` / ``url_hint`` 由 DynamicDispatcher 从入站消息解析后传入。
         触发词校验与 add_text 同源（长度 + 保留词）；图片字节的解码/空判定/大小校验在此完成。
-        触发词已存在时直接覆盖（与 add_text 语义一致）。
+        触发词已存在时直接覆盖（与 add_text 语义一致）。``ignored_image_count`` 为同条消息中
+        被忽略的额外图片数（仅取第一张），>0 时在成功回执里提示用户。
         """
         p = self._plugin
         if not p._check_admin(user_id):
@@ -199,7 +207,10 @@ class CommandService:
             return False, "无图片数据", 1
 
         max_size = p.config.settings.max_image_size
-        normalized_b64 = b64_data.strip()
+        # 去除全部空白（含内部换行）而非仅首尾：validate=True 会拒绝任何非 base64 字母表字符。
+        # 当前 napcat 给的是无换行标准 base64，但若换用按 76 字符折行（MIME 风格）的来源，仅
+        # strip 首尾会让中间换行触发解码失败；统一清空白做前向加固，不改变现有 napcat 行为。
+        normalized_b64 = re.sub(r"\s", "", b64_data)
         # 解码前按 base64 长度粗筛超大图，避免对明显超限的大字符串做无谓的 b64decode（省内存/CPU）；
         # 真正的精确校验由下方解码后的 len(image_bytes) > max_size 兜底。
         # base64 每 4 字符编码 3 字节 → 解码后字节数 ≈ len(b64) * 3 // 4，此估算比真实值最多高估 2
@@ -230,6 +241,24 @@ class CommandService:
             )
             return False, "图片过大", 1
 
+        # 带图添加的字节必须是真实图片：未匹配已知魔数则拒绝，避免非图片内容被
+        # guess_extension 兜底存成 .png 后触发时发送失败或行为不可预期。
+        if not p._images.has_image_magic(image_bytes):
+            await self._send_text(
+                "❌ 附带的内容不是受支持的图片格式（仅支持 PNG/JPEG/GIF/WebP），未保存",
+                stream_id,
+                context="非图片格式提示",
+            )
+            return False, "非图片格式", 1
+
+        if p._data_manager.is_protected:
+            await self._send_text(
+                "❌ 命令数据文件加载失败，已进入保护模式；请先修复 custom_commands.json 后重载插件，再修改命令",
+                stream_id,
+                context="数据保护提示",
+            )
+            return False, "数据保护模式", 1
+
         scope_id, scope_used = self._resolve_scope(group_id, user_id)
         filename = p._images.managed_filename_for(image_bytes, url_hint)
         orphan: Optional[str] = None
@@ -246,6 +275,10 @@ class CommandService:
                     trigger, filename, scope_used,
                     max_per_scope=p.config.settings.max_commands_per_scope,
                 )
+            except DataProtectionError as exc:
+                logger.warning("拒绝添加图片命令以保护损坏的数据文件: %s", exc)
+                await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+                return False, "数据保护模式", 1
             except ValueError as exc:
                 # 命令数超限：本次已落盘的图未能写入任何命令，若不被现有命令引用则回收，避免孤儿堆积。
                 # 同 hash 图可能已被其它触发词引用，故须判断引用计数；这里仍持有文件级锁，避免清理
@@ -271,10 +304,16 @@ class CommandService:
         scope_desc = build_scope_desc(scope_id, scope_used)
 
         cmd_prefix = p.config.settings.command_prefix
+        # 带图添加仅取第一张：用户同条消息附带多张有效图片时，在成功回执里明确提示，
+        # 避免误以为多张都已绑定（ignored_image_count 由 DynamicDispatcher 统计后传入）。
+        multi_image_hint = (
+            f"\n⚠️ 检测到 {ignored_image_count + 1} 张图片，仅保存了第一张"
+            if ignored_image_count > 0 else ""
+        )
         await self._send_text(
             f"✅ 成功添加图片命令{scope_desc}！\n"
             f"触发词：{trigger}\n"
-            f"发送 {cmd_prefix}{trigger} 即可获取这张图片",
+            f"发送 {cmd_prefix}{trigger} 即可获取这张图片{multi_image_hint}",
             stream_id,
             context="添加图片命令成功提示",
         )
@@ -301,6 +340,10 @@ class CommandService:
         _, current_scope = self._resolve_scope(group_id, user_id)
         try:
             success, orphan = await p._data_manager.delete(trigger, current_scope)
+        except DataProtectionError as exc:
+            logger.warning("拒绝删除命令以保护损坏的数据文件: %s", exc)
+            await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+            return False, "数据保护模式", 1
         except OSError as exc:
             logger.error("保存命令数据失败: %s", exc, exc_info=True)
             await self._send_text(
@@ -345,6 +388,10 @@ class CommandService:
         trigger = matched_groups.get("trigger", "").strip()
         try:
             success, orphan = await p._data_manager.delete_global(trigger)
+        except DataProtectionError as exc:
+            logger.warning("拒绝删除全局命令以保护损坏的数据文件: %s", exc)
+            await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+            return False, "数据保护模式", 1
         except OSError as exc:
             logger.error("保存命令数据失败: %s", exc, exc_info=True)
             await self._send_text(

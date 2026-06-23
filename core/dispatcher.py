@@ -59,31 +59,38 @@ class DynamicDispatcher:
         return "".join(text_parts), image_segs
 
     @staticmethod
-    def _pick_image(image_segs: List[Dict[str, Any]]) -> Tuple[str, str]:
-        """取第一张带 binary_data_base64 的图片段，返回 (b64_data, url_hint)。
+    def _pick_image(image_segs: List[Dict[str, Any]]) -> Tuple[str, str, int]:
+        """取第一张带 binary_data_base64 的图片段，并统计有效图片总数。
+
+        返回 (b64_data, url_hint, valid_count)：valid_count 为带 binary_data_base64 的
+        图片段数量，供调用方在多图时提示"仅保存第一张"。
 
         napcat 适配器的 image/emoji 段 data 字段在下载后被清空（恒为 ""，见适配器
         _build_image_like_segment），故 url_hint 在 napcat 下实际取不到后缀，扩展名
         由 ImageStore.guess_extension 的二进制 magic number 兜底；保留 url_hint 仅为
         兼容「会在 data 里给出 url」的其他适配器。
         """
+        first_b64 = ""
+        first_hint = ""
+        valid_count = 0
         for seg in image_segs:
             candidate = seg.get("binary_data_base64")
-            if isinstance(candidate, str) and candidate:
-                data_field = seg.get("data")
-                if isinstance(data_field, str):
-                    url_hint = data_field
-                elif isinstance(data_field, dict):
-                    url_hint = ""
-                    for key in ("url", "file", "path", "summary"):
-                        value = data_field.get(key)
-                        if isinstance(value, str) and value:
-                            url_hint = value
-                            break
-                else:
-                    url_hint = ""
-                return candidate, url_hint
-        return "", ""
+            if not (isinstance(candidate, str) and candidate):
+                continue
+            valid_count += 1
+            if first_b64:
+                continue  # 已锁定第一张，后续仅继续计数
+            first_b64 = candidate
+            data_field = seg.get("data")
+            if isinstance(data_field, str):
+                first_hint = data_field
+            elif isinstance(data_field, dict):
+                for key in ("url", "file", "path", "summary"):
+                    value = data_field.get(key)
+                    if isinstance(value, str) and value:
+                        first_hint = value
+                        break
+        return first_b64, first_hint, valid_count
 
     async def dispatch(self, message: Optional[dict]) -> Optional[Dict[str, Any]]:
         """动态触发命令的 hook 入口逻辑。
@@ -170,7 +177,7 @@ class DynamicDispatcher:
         if not base_text:
             return None
         # 前缀校验由正则 ^<prefix>问： 承担；base_text 已不含占位符干扰。
-        match = re.match(rf"^{re.escape(prefix)}{KW_ADD}(?P<trigger>.+?){KW_ADD_ANSWER}", base_text)
+        match = re.match(rf"^{re.escape(prefix)}{re.escape(KW_ADD)}(?P<trigger>.+?){re.escape(KW_ADD_ANSWER)}", base_text)
         if not match:
             return None  # 有图但文本不符合添加格式 → 放行（带图触发或普通图片消息）
 
@@ -184,6 +191,16 @@ class DynamicDispatcher:
         if not stream_id:
             return None  # 没有可回复的会话，交回主链
 
+        # 确认是带图添加意图后，先做与文本添加路径一致的管理员校验：无论「答：」后是否多填
+        # 文字，非管理员都应先收到统一的「无权限」提示，而不是先撞上格式约束（既与文本添加
+        # 路径行为不一致，又把内部格式细节暴露给无权限用户）。管理员通过后再继续后续校验；
+        # add_image 内仍会再校验一次权限，作为该方法独立入口的防御，冗余但无害。
+        if not self._plugin._check_admin(user_id):
+            await self._plugin._service._send_text(
+                "❌ 你没有权限执行此管理员命令", stream_id, context="无权限提示",
+            )
+            return {"action": "abort"}
+
         trailing_text = base_text[match.end():].strip()
         if trailing_text:
             await self._plugin._service._send_text(
@@ -194,10 +211,12 @@ class DynamicDispatcher:
             return {"action": "abort"}
 
         trigger = match.group("trigger").strip()
-        # 仅支持单张图片：取第一张带 binary_data_base64 的图片段。
-        b64_data, url_hint = self._pick_image(image_segs)
+        # 仅支持单张图片：取第一张带 binary_data_base64 的图片段，并拿到有效图片总数；
+        # 多于一张时由 add_image 在成功回执里提示"仅保存第一张"，避免用户误以为多张都已绑定。
+        b64_data, url_hint, valid_count = self._pick_image(image_segs)
         # 权限 / 触发词 / 图片字节的全部校验与回执都在 service.add_image 内完成
         await self._plugin._service.add_image(
             trigger, b64_data, url_hint, stream_id, group_id, user_id,
+            ignored_image_count=max(0, valid_count - 1),
         )
         return {"action": "abort"}
