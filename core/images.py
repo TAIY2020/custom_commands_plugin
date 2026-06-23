@@ -130,6 +130,21 @@ class ImageStore:
                 return ".jpg" if ext == ".jpeg" else ext
         return ".png"
 
+    @staticmethod
+    def has_image_magic(data: bytes) -> bool:
+        """``data`` 是否以已知图片格式的魔数开头（PNG / JPEG / GIF / WebP）。
+
+        带图添加的二进制理应是真实图片，用它在落盘前拦截非图片内容，避免把未知字节
+        按 ``guess_extension`` 的兜底回退存成 ``.png``（换适配器或适配器异常时可能发生）。
+        与 ``guess_extension`` 共用同一组魔数判断，两者须同步维护。
+        """
+        return (
+            data[:8] == b"\x89PNG\r\n\x1a\n"
+            or data[:3] == b"\xff\xd8\xff"
+            or data[:6] in (b"GIF87a", b"GIF89a")
+            or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+        )
+
     def managed_filename_for(self, data: bytes, url_hint: str = "") -> str:
         """按图片内容生成托管文件名，供调用方在保存前先获取文件级锁。"""
         ext = self.guess_extension(data, url_hint)
@@ -164,6 +179,18 @@ class ImageStore:
     async def store_prepared(self, image_bytes: bytes, filename: str) -> str:
         """在调用方已持有 ``managed_file_lock(filename)`` 时落盘指定托管文件名。"""
         return await asyncio.to_thread(self._save_bytes_sync, image_bytes, filename)
+
+    async def _send_error_text(self, text: str, stream_id: str, *, context: str) -> bool:
+        """发送图片错误提示并吞掉发送异常，避免错误路径再次抛出。"""
+        try:
+            send_ok = await self._plugin.ctx.send.text(text, stream_id)
+        except Exception as exc:
+            logger.warning("%s发送异常: %s", context, exc, exc_info=True)
+            return False
+        if send_ok is False:
+            logger.warning("%s发送失败：send.text 返回 False（可能被风控或连接异常）", context)
+            return False
+        return True
 
     async def cleanup_orphan_locked(
         self, filename: str, data_manager: Any, *, file_lock_held: bool = False,
@@ -235,13 +262,14 @@ class ImageStore:
         image_path = self.safe_path(response_value)
         if image_path is None:
             logger.warning("检测到路径穿越尝试: '%s'", response_value)
-            await p.ctx.send.text("❌ 图片路径不合法", stream_id)
+            await self._send_error_text("❌ 图片路径不合法", stream_id, context="图片路径非法提示")
             return
 
         if not image_path.exists():
             # 仅向用户展示文件名，不泄露服务器内部路径
-            await p.ctx.send.text(
+            await self._send_error_text(
                 f"❌ 找不到图片文件 '{response_value}'", stream_id,
+                context="图片不存在提示",
             )
             logger.warning("图片文件不存在: %s", image_path)
             return
@@ -259,20 +287,21 @@ class ImageStore:
                     actual_size = 0
                 size_mb = actual_size / (1024 * 1024)
                 limit_mb = max_image_size / (1024 * 1024)
-                await p.ctx.send.text(
+                await self._send_error_text(
                     f"❌ 图片文件过大（{size_mb:.1f}MB，上限 {limit_mb:.0f}MB）",
                     stream_id,
+                    context="图片过大提示",
                 )
                 return
             logger.error("读取图片失败: %s", encode_error)
-            await p.ctx.send.text("❌ 读取图片文件时发生错误", stream_id)
+            await self._send_error_text("❌ 读取图片文件时发生错误", stream_id, context="图片读取失败提示")
             return
 
         try:
             send_ok = await p.ctx.send.image(b64_img_data, stream_id)
         except Exception as e:
             logger.error("发送动态图片失败: %s", e)
-            await p.ctx.send.text("❌ 发送图片时发生内部错误", stream_id)
+            await self._send_error_text("❌ 发送图片时发生内部错误", stream_id, context="图片发送异常提示")
             return
         # ctx.send.image 业务失败时返回 False 而非抛异常（见 SDK context.py
         # _BOOLEAN_SUCCESS_CAPABILITIES）；此时连接通常正常、错误文案能发出，显式告知用户，
@@ -280,4 +309,7 @@ class ImageStore:
         # 其余返回形态（True / 兼容旧 Host 的原始结果）按成功处理，不误报。
         if send_ok is False:
             logger.warning("发送动态图片失败：send.image 返回 False（可能被风控或格式不受支持）")
-            await p.ctx.send.text("❌ 图片发送失败，可能被风控或格式不受支持", stream_id)
+            await self._send_error_text(
+                "❌ 图片发送失败，可能被风控或格式不受支持", stream_id,
+                context="图片发送失败提示",
+            )

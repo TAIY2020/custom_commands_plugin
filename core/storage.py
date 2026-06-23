@@ -21,6 +21,10 @@ from .common import DEFAULT_MAX_COMMANDS_PER_SCOPE
 logger = logging.getLogger(__name__)
 
 
+class DataProtectionError(RuntimeError):
+    """命令数据文件加载失败后进入保护模式，拒绝继续覆盖原文件。"""
+
+
 class CommandDataManager:
     """自定义命令数据的加载、保存和查询。**只关心已解析的作用域名 + 数据**。
 
@@ -36,8 +40,21 @@ class CommandDataManager:
         self.file_path: Optional[Path] = None
         self._lock = asyncio.Lock()
         # 加载已存在文件时发生解析/读取失败 → True。此时内存被重置为空库，若再落盘会覆盖
-        # 用户原始（可能只是手工编辑出错、仍可修复）的数据，故卸载收尾的 save_locked 会跳过保存。
+        # 用户原始（可能只是手工编辑出错、仍可修复）的数据，故运行期写入与卸载保存都要拒绝。
         self._load_failed = False
+
+    @property
+    def is_protected(self) -> bool:
+        """命令数据是否因加载失败进入保护模式。"""
+        return self._load_failed
+
+    def _ensure_writable(self) -> None:
+        """保护模式下拒绝任何会覆盖 custom_commands.json 的写入。"""
+        if self._load_failed:
+            raise DataProtectionError(
+                "命令数据文件加载失败，已进入保护模式；"
+                "请先修复 custom_commands.json 后重载插件，再修改命令"
+            )
 
     def load(self, plugin_dir: str) -> None:
         """加载命令数据文件，包含深层数据校验。
@@ -168,6 +185,7 @@ class CommandDataManager:
 
     async def save(self) -> None:
         """持久化命令数据到 JSON 文件（异步版本，避免阻塞事件循环）。"""
+        self._ensure_writable()
         await asyncio.to_thread(self._save_sync)
 
     async def save_locked(self) -> None:
@@ -207,6 +225,7 @@ class CommandDataManager:
             ValueError: 当作用域命令数达到上限时抛出。
         """
         async with self._lock:
+            self._ensure_writable()
             scope_created = scope not in self.commands
             if scope_created:
                 self.commands[scope] = {}
@@ -248,6 +267,7 @@ class CommandDataManager:
             第二项供调用方清理孤儿资源；仍被其他命令引用或未删除时为 None。
         """
         async with self._lock:
+            self._ensure_writable()
             if scope in self.commands and trigger in self.commands[scope]:
                 old_value = self.commands[scope][trigger]
                 del self.commands[scope][trigger]
@@ -273,6 +293,7 @@ class CommandDataManager:
             Tuple[bool, Optional[str]]: ``(是否真的删除, 删除后失去全部引用的旧回复内容)``。
         """
         async with self._lock:
+            self._ensure_writable()
             if "global" in self.commands and trigger in self.commands["global"]:
                 old_value = self.commands["global"][trigger]
                 del self.commands["global"][trigger]

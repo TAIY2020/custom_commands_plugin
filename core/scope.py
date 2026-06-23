@@ -93,6 +93,15 @@ class ScopeResolver:
             name = name.strip()
             if not name:
                 continue
+            # "global" 是全局共享分区的保留名：若允许把某些群显式映射到 global，开启隔离时
+            # 这些群会被悄悄并入全局库，可见范围被意外放大，且与"未映射群才回退 global"的语义
+            # 冲突。拒绝该条并告警——需要全局共享请直接关闭 enable_group_isolation。
+            if name == "global":
+                logger.warning(
+                    "group_scopes 中作用域名 'global' 为保留名，已忽略该条映射；"
+                    "如需让这些群共享全局命令，请改为关闭 enable_group_isolation",
+                )
+                continue
             group_ids = [g.strip() for g in ids_part.split(",") if g.strip()]
             if not group_ids:
                 continue

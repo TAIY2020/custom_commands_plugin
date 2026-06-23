@@ -27,6 +27,7 @@ from .common import (
     looks_like_image_response,
     resolve_scope_id,
 )
+from .storage import DataProtectionError
 
 if TYPE_CHECKING:
     from ..plugin import CustomCommandsPlugin
@@ -141,6 +142,10 @@ class CommandService:
         except ValueError as exc:
             await self._send_text(f"❌ {exc}", stream_id, context="命令数量超限提示")
             return False, "命令数量超限", 1
+        except DataProtectionError as exc:
+            logger.warning("拒绝添加命令以保护损坏的数据文件: %s", exc)
+            await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+            return False, "数据保护模式", 1
         except OSError as exc:
             logger.error("保存命令数据失败: %s", exc, exc_info=True)
             await self._send_text(
@@ -236,6 +241,24 @@ class CommandService:
             )
             return False, "图片过大", 1
 
+        # 带图添加的字节必须是真实图片：未匹配已知魔数则拒绝，避免非图片内容被
+        # guess_extension 兜底存成 .png 后触发时发送失败或行为不可预期。
+        if not p._images.has_image_magic(image_bytes):
+            await self._send_text(
+                "❌ 附带的内容不是受支持的图片格式（仅支持 PNG/JPEG/GIF/WebP），未保存",
+                stream_id,
+                context="非图片格式提示",
+            )
+            return False, "非图片格式", 1
+
+        if p._data_manager.is_protected:
+            await self._send_text(
+                "❌ 命令数据文件加载失败，已进入保护模式；请先修复 custom_commands.json 后重载插件，再修改命令",
+                stream_id,
+                context="数据保护提示",
+            )
+            return False, "数据保护模式", 1
+
         scope_id, scope_used = self._resolve_scope(group_id, user_id)
         filename = p._images.managed_filename_for(image_bytes, url_hint)
         orphan: Optional[str] = None
@@ -252,6 +275,10 @@ class CommandService:
                     trigger, filename, scope_used,
                     max_per_scope=p.config.settings.max_commands_per_scope,
                 )
+            except DataProtectionError as exc:
+                logger.warning("拒绝添加图片命令以保护损坏的数据文件: %s", exc)
+                await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+                return False, "数据保护模式", 1
             except ValueError as exc:
                 # 命令数超限：本次已落盘的图未能写入任何命令，若不被现有命令引用则回收，避免孤儿堆积。
                 # 同 hash 图可能已被其它触发词引用，故须判断引用计数；这里仍持有文件级锁，避免清理
@@ -313,6 +340,10 @@ class CommandService:
         _, current_scope = self._resolve_scope(group_id, user_id)
         try:
             success, orphan = await p._data_manager.delete(trigger, current_scope)
+        except DataProtectionError as exc:
+            logger.warning("拒绝删除命令以保护损坏的数据文件: %s", exc)
+            await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+            return False, "数据保护模式", 1
         except OSError as exc:
             logger.error("保存命令数据失败: %s", exc, exc_info=True)
             await self._send_text(
@@ -357,6 +388,10 @@ class CommandService:
         trigger = matched_groups.get("trigger", "").strip()
         try:
             success, orphan = await p._data_manager.delete_global(trigger)
+        except DataProtectionError as exc:
+            logger.warning("拒绝删除全局命令以保护损坏的数据文件: %s", exc)
+            await self._send_text(f"❌ {exc}", stream_id, context="数据保护提示")
+            return False, "数据保护模式", 1
         except OSError as exc:
             logger.error("保存命令数据失败: %s", exc, exc_info=True)
             await self._send_text(
