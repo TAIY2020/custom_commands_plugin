@@ -12,6 +12,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -41,9 +42,10 @@ class CommandDataManager:
     def load(self, plugin_dir: str) -> None:
         """加载命令数据文件，包含深层数据校验。
 
-        已存在文件解析/读取失败时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，再置
-        ``_load_failed`` 并把内存设为空库；据此 ``save_locked``（on_unload 收尾）会跳过保存，
-        避免空库覆盖用户仅手工编辑出错、仍可原地修复的原始数据。
+        已存在文件解析/读取失败、或 JSON 能解析但结构语义异常（顶层非 dict、或任一作用域
+        非 dict/含非字符串键值）时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，再置
+        ``_load_failed``（结构异常时仍保留可识别的合法作用域到内存）；据此 ``save_locked``
+        （on_unload 收尾）会跳过保存，避免清洗/重置后的内存静默覆盖用户仍可手工修复的原始数据。
         """
         self.file_path = Path(plugin_dir) / "custom_commands.json"
         self._load_failed = False
@@ -73,23 +75,43 @@ class CommandDataManager:
             self.commands = {"global": {}}
             return
 
-        # 深层校验：必须是 Dict[str, Dict[str, str]]
+        # 深层校验：必须是 Dict[str, Dict[str, str]]。
+        # 关键：JSON 能解析但语义结构不符（顶层非 dict、或任一作用域非 dict/含非字符串键值）
+        # 时，同样视为"文件已非插件干净格式"——备份原文件并置 _load_failed，让 on_unload 的
+        # save_locked 跳过自动保存，避免用"清洗/重置后的版本"静默覆盖用户仍可手工修复的原始
+        # 数据（与 JSONDecodeError/OSError 分支同一保护语义；此前这里只 warning 不保护是隐患）。
         if not isinstance(data, dict):
-            logger.warning("命令数据格式异常（非字典），已重置为空")
+            logger.error(
+                "命令数据顶层结构异常（非字典），已备份原文件并进入保护模式，"
+                "卸载时将不会自动保存以免覆盖",
+            )
+            self._load_failed = True
+            self._backup_corrupt_file()
             self.commands = {"global": {}}
-        else:
-            validated: Dict[str, Dict[str, str]] = {}
-            for scope_key, scope_val in data.items():
-                if isinstance(scope_val, dict) and all(
-                    isinstance(k, str) and isinstance(v, str)
-                    for k, v in scope_val.items()
-                ):
-                    validated[scope_key] = scope_val
-                else:
-                    logger.warning("作用域 '%s' 数据格式异常，已跳过", scope_key)
-            self.commands = validated if validated else {"global": {}}
-            if "global" not in self.commands:
-                self.commands["global"] = {}
+            return
+
+        validated: Dict[str, Dict[str, str]] = {}
+        has_corrupt_scope = False
+        for scope_key, scope_val in data.items():
+            if isinstance(scope_val, dict) and all(
+                isinstance(k, str) and isinstance(v, str)
+                for k, v in scope_val.items()
+            ):
+                validated[scope_key] = scope_val
+            else:
+                has_corrupt_scope = True
+                logger.warning("作用域 '%s' 数据格式异常，已跳过", scope_key)
+        # 任一作用域被判损坏：合法作用域仍载入内存供本次运行使用，但备份原文件并进入保护
+        # 模式，避免卸载自动保存时把损坏作用域从磁盘上静默抹掉（用户可能想手工修复它们）。
+        if has_corrupt_scope:
+            logger.error(
+                "部分作用域数据结构异常，已备份原文件并进入保护模式，卸载时将不会自动保存以免覆盖",
+            )
+            self._load_failed = True
+            self._backup_corrupt_file()
+        self.commands = validated if validated else {"global": {}}
+        if "global" not in self.commands:
+            self.commands["global"] = {}
         total_cmds = sum(len(scope) for scope in self.commands.values())
         logger.info(
             "成功加载 %d 条自定义命令 (涵盖 %d 个作用域)",
@@ -122,7 +144,11 @@ class CommandDataManager:
         """
         if not self.file_path:
             return
-        tmp_path = self.file_path.with_suffix(".json.tmp")
+        # 临时文件名加入随机后缀，避免热重载/跨实例并发保存时多个进程争用同一个固定 .tmp
+        # 导致写入交错损坏（与 images.py 图片落盘同一防御）。前缀 "." 让它在目录里不显眼。
+        tmp_path = self.file_path.with_name(
+            f".{self.file_path.name}.{uuid.uuid4().hex}.tmp"
+        )
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self.commands, f, ensure_ascii=False, indent=4)

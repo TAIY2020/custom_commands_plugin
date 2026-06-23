@@ -84,9 +84,9 @@ PREFIX_PLACEHOLDER = r"[^\w\s]"
 # pattern 用这些常量拼接，is_reserved_trigger 也由它们派生：改一处即同步两处，
 # 避免新增/调整内置命令时 pattern 与保留词列表漂移（漂移会让同名动态 trigger 与
 # 内置命令互相抢占，或在数据里产生永不触发的幽灵命令）。
-# ⚠️ 约束：这些关键字会被【未经 re.escape】直接拼进 @Command 的正则 pattern 与
-# 带图添加的 re.match，因此值中不得出现正则元字符（. ^ $ * + ? ( ) [ ] { } | \ 等）。
-# 当前值均为中文字符 + 全角冒号，正则安全；若日后调整，务必保持这一约束，否则命令匹配会失效。
+# 这些关键字会被拼进 @Command 的正则 pattern 与带图添加的 re.match，但拼接处统一用
+# re.escape() 包裹（见 plugin.py 各 pattern 与 dispatcher.py 的 re.match），故即便值中含
+# 正则元字符也安全；调整关键字时无需再担心正则转义。
 KW_ADD = "问："
 KW_ADD_ANSWER = "答："  # add 命令中 trigger 与 response 的分隔符
 KW_DELETE = "删："

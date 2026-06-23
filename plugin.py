@@ -271,7 +271,11 @@ class CustomCommandsPlugin(MaiBotPlugin):
     @Command(
         "custom_command_add",
         description="添加自定义命令。格式：<前缀>问：触发词答：回复内容",
-        pattern=rf"^{PREFIX_PLACEHOLDER}{KW_ADD}(?P<trigger>.+?){KW_ADD_ANSWER}(?P<response>.+)$",
+        # response 段用 [\s\S]+ 而非 .+：Host 编译命令正则是 re.compile(pattern) 且不带
+        # re.DOTALL（见主程序 host/component_registry.py），.+ 不跨行会让「答：」后含换行的
+        # 多行回复整体失配、消息漏过命令路径落入 LLM。[\s\S]+ 显式匹配含换行的任意字符以
+        # 支持多行回复；trigger 段仍用 .+? 保持单行（「问：」与「答：」须在同一行）。
+        pattern=rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_ADD)}(?P<trigger>.+?){re.escape(KW_ADD_ANSWER)}(?P<response>[\s\S]+)$",
     )
     async def handle_add(self, stream_id: str = "", group_id: str = "",
                          user_id: str = "", text: str = "",
@@ -283,7 +287,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
     @Command(
         "custom_command_delete",
         description="删除自定义命令。格式：<前缀>删：触发词",
-        pattern=rf"^{PREFIX_PLACEHOLDER}{KW_DELETE}(?P<trigger>.+)$",
+        pattern=rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_DELETE)}(?P<trigger>.+)$",
     )
     async def handle_delete(self, stream_id: str = "", group_id: str = "",
                             user_id: str = "", text: str = "",
@@ -295,7 +299,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
     @Command(
         "custom_command_delete_global",
         description="删除全局自定义命令。格式：<前缀>删全局：触发词",
-        pattern=rf"^{PREFIX_PLACEHOLDER}{KW_DELETE_GLOBAL}(?P<trigger>.+)$",
+        pattern=rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_DELETE_GLOBAL)}(?P<trigger>.+)$",
     )
     async def handle_delete_global(self, stream_id: str = "", group_id: str = "",
                                    user_id: str = "", text: str = "",
@@ -307,7 +311,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
     @Command(
         "custom_command_list",
         description="列出所有可用的自定义命令。格式：<前缀>列表",
-        pattern=rf"^{PREFIX_PLACEHOLDER}{KW_LIST}$",
+        pattern=rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_LIST)}$",
     )
     async def handle_list(self, stream_id: str = "", group_id: str = "",
                           user_id: str = "", text: str = "",

@@ -37,6 +37,9 @@ class ScopeResolver:
         """旧 dict 格式 group_scopes 转 List[str]；同时清洗每条两端的成对引号。"""
         if not isinstance(data, dict):
             return data
+        # 浅拷贝后再改，避免原地修改调用方（pydantic model_validator(before) 的输入 dict）
+        # 产生副作用；下面只整体替换 group_scopes 这一个键，浅拷贝即足够。
+        data = dict(data)
         legacy = data.get("group_scopes")
         if isinstance(legacy, dict):
             converted: List[str] = []
@@ -76,7 +79,7 @@ class ScopeResolver:
         """将 List[str] 格式的 group_scopes 解析为 {作用域名: [群号]}。
 
         每条字符串约定语法 ``"作用域名:群号1,群号2"``。
-        非法/空条目静默跳过；重复作用域名后者覆盖前者。
+        非法/空条目静默跳过；重复作用域名合并各条群号并告警（不再静默覆盖）。
         防御性剥掉外层成对引号，防止用户照旧示例输入时残留干扰解析。
         """
         result: Dict[str, List[str]] = {}
@@ -91,7 +94,19 @@ class ScopeResolver:
             if not name:
                 continue
             group_ids = [g.strip() for g in ids_part.split(",") if g.strip()]
-            if group_ids:
+            if not group_ids:
+                continue
+            if name in result:
+                # 同名作用域出现多次：合并各条群号（去重保序）而非静默覆盖，并告警提示排查，
+                # 避免用户写了两行同名映射却只有最后一行生效、群号神秘丢失。
+                logger.warning(
+                    "作用域名 '%s' 在 group_scopes 中重复出现，已合并各条目的群号；"
+                    "若非有意，请检查配置是否笔误", name,
+                )
+                for gid in group_ids:
+                    if gid not in result[name]:
+                        result[name].append(gid)
+            else:
                 result[name] = group_ids
         return result
 
