@@ -70,7 +70,7 @@ class ImageStore:
 
     def resolve_dir(self) -> Path:
         """将配置中的 image_directory 解析为绝对 Path。
-        相对路径基于插件目录解析，绝对路径直接使用。
+        相对路径基于插件持久数据目录（ctx.paths.data_dir）解析，绝对路径直接使用。
         """
         configured = self._plugin.config.settings.image_directory
         path = Path(configured)
@@ -83,7 +83,7 @@ class ImageStore:
                 )
                 self._warned_absolute_image_dir = normalized
         if not path.is_absolute():
-            base = Path(self._plugin._plugin_dir) if self._plugin._plugin_dir else Path.cwd()
+            base = Path(self._plugin._data_dir or self._plugin._plugin_dir or Path.cwd())
             path = base / path
         return path.resolve()
 

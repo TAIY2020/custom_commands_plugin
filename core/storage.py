@@ -56,15 +56,15 @@ class CommandDataManager:
                 "请先修复 custom_commands.json 后重载插件，再修改命令"
             )
 
-    def load(self, plugin_dir: str) -> None:
-        """加载命令数据文件，包含深层数据校验。
+    def load(self, data_dir: str) -> None:
+        """从 ``data_dir``（插件持久数据目录）加载命令数据文件，包含深层数据校验。
 
         已存在文件解析/读取失败、或 JSON 能解析但结构语义异常（顶层非 dict、或任一作用域
         非 dict/含非字符串键值）时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，再置
         ``_load_failed``（结构异常时仍保留可识别的合法作用域到内存）；据此 ``save_locked``
         （on_unload 收尾）会跳过保存，避免清洗/重置后的内存静默覆盖用户仍可手工修复的原始数据。
         """
-        self.file_path = Path(plugin_dir) / "custom_commands.json"
+        self.file_path = Path(data_dir) / "custom_commands.json"
         self._load_failed = False
 
         # 文件不存在：新建空库。新建失败仅记日志，不算"加载失败"——没有原始数据需要保护，
