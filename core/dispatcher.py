@@ -166,10 +166,11 @@ class DynamicDispatcher:
         不受图文顺序影响。
 
         返回值语义：
-        - ``None``                —— 不是带图添加场景（无图 / 文本不符合添加格式 /
-                                     无可回复会话），调用方继续走 reserved 判断与动态触发。
-        - ``{"action": "abort"}`` —— 已确认是带图添加，业务已交由 CommandService.add_image
-                                     处理完毕（成功或失败都已回发消息），拦截后续主链。
+        - ``None``                —— 不是带图添加场景（无图 / 文本不符合添加格式），
+                                     调用方继续走 reserved 判断与动态触发。
+        - ``{"action": "abort"}`` —— 已确认是带图添加：业务已交由 CommandService.add_image
+                                     处理完毕（成功或失败都已回发消息），或缺少可回复会话
+                                     无法回执但仍拦截（避免漏入 LLM 主链），拦截后续主链。
         """
         if not image_segs:
             return None  # 没有图片 → 不是带图添加，放行
@@ -189,7 +190,10 @@ class DynamicDispatcher:
         group_id = str(group_info.get("group_id") or "")
         user_id = str(user_info.get("user_id") or "")
         if not stream_id:
-            return None  # 没有可回复的会话，交回主链
+            # 意图已确认是带图添加：虽无可回复会话（无法回执），也不能放行——否则这条
+            # 「问：x答：+图片」会漏进 LLM 主链被 AI 二次回复。记日志后直接拦截。
+            logger.warning("带图添加消息缺少 session_id，无法回执；已拦截以免漏入 LLM 主链")
+            return {"action": "abort"}
 
         # 确认是带图添加意图后，先做与文本添加路径一致的管理员校验：无论「答：」后是否多填
         # 文字，非管理员都应先收到统一的「无权限」提示，而不是先撞上格式约束（既与文本添加

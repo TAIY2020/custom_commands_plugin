@@ -33,6 +33,8 @@ import asyncio
 import logging
 import os
 import re
+import shutil
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .core.common import (
@@ -75,6 +77,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         self._scope_resolver = ScopeResolver()
         # 生命周期状态
         self._plugin_dir: str = ""
+        self._data_dir: str = ""  # 持久数据目录（ctx.paths.data_dir），命令 JSON 与托管图片的存放基准
         self._admin_set: set[str] = set()  # 缓存管理员集合
         self._registered_prefix: Optional[str] = None  # 注册到主程序时使用的 prefix，用于检测热改
         self._self_reload_scheduled: bool = False  # 标记是否已调度自重载任务，防重入
@@ -107,8 +110,15 @@ class CustomCommandsPlugin(MaiBotPlugin):
         components = super().get_components()
         try:
             prefix = self.config.settings.command_prefix
-        except Exception:
-            return components
+        except Exception as exc:
+            # 读不到前缀时不能原样返回：pattern 里的 [^\w\s] 占位仍是通配状态，会匹配任意
+            # 单个标点前缀，在 Host first-match-wins 分发下抢占其他插件的命令。宁可本插件
+            # 内置命令暂时失效，也要把 4 个 COMMAND 组件剔除，避免误伤他人。
+            logger.error(
+                "读取 command_prefix 失败: %s；已剔除全部 COMMAND 组件以免占位符通配抢占其他插件命令，"
+                "请检查配置后重载插件", exc,
+            )
+            return [comp for comp in components if comp.get("type") != "COMMAND"]
 
         escaped_prefix = re.escape(prefix)
         for comp in components:
@@ -126,12 +136,66 @@ class CustomCommandsPlugin(MaiBotPlugin):
         self._registered_prefix = prefix
         return components
 
+    def _resolve_data_dir(self) -> str:
+        """解析持久数据目录（SDK 2.6.0 ctx.paths.data_dir），失败时回退插件目录。
+
+        回退仅为兜底旧 Host / 异常场景：此时行为等同旧版本（数据随插件目录），
+        不迁移也不破坏任何数据。
+        """
+        try:
+            data_dir = Path(self.ctx.paths.data_dir)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            return str(data_dir)
+        except Exception as e:
+            logger.warning("获取插件持久数据目录失败: %s；回退到插件目录存储", e)
+            return self._plugin_dir
+
+    def _migrate_legacy_data_sync(self) -> None:
+        """把旧版本存在插件目录内的数据一次性迁移到持久数据目录（同步，须经 to_thread）。
+
+        幂等性依赖「新路径已存在即跳过」：迁移用 copy 而非 move，旧文件原地保留充当
+        备份快照，后续运行因新路径已存在而不再重复迁移，也永远不会反向覆盖新数据。
+        仅迁移两类内容：``custom_commands.json`` 与默认相对路径的图片目录；
+        用户把 image_directory 配成绝对路径时图片本就不在插件目录内，无需迁移。
+        """
+        if not self._data_dir or self._data_dir == self._plugin_dir:
+            return
+
+        old_json = Path(self._plugin_dir) / "custom_commands.json"
+        new_json = Path(self._data_dir) / "custom_commands.json"
+        if old_json.exists() and not new_json.exists():
+            try:
+                shutil.copy2(old_json, new_json)
+                logger.info("已把命令数据从插件目录迁移到持久目录: %s", new_json)
+            except OSError as e:
+                logger.error("迁移命令数据失败: %s；本次将从持久目录空库启动，旧数据仍在 %s", e, old_json)
+
+        try:
+            configured = Path(self.config.settings.image_directory)
+        except Exception:
+            return
+        if configured.is_absolute():
+            return
+        old_images = (Path(self._plugin_dir) / configured).resolve()
+        new_images = (Path(self._data_dir) / configured).resolve()
+        if old_images.is_dir() and not new_images.exists():
+            try:
+                shutil.copytree(old_images, new_images)
+                logger.info("已把图片目录从插件目录迁移到持久目录: %s", new_images)
+            except OSError as e:
+                logger.error("迁移图片目录失败: %s；图片命令可能暂时找不到文件，旧图片仍在 %s", e, old_images)
+
     async def on_load(self) -> None:
         """插件加载时初始化数据管理器和图片目录。"""
         self._plugin_dir = os.path.dirname(os.path.abspath(__file__))
+        self._data_dir = self._resolve_data_dir()
+
+        # 旧版本把数据存在插件目录内，插件更新/重装会连数据一起丢；
+        # 迁移到 Host 授予的持久目录，再从持久目录加载。
+        await asyncio.to_thread(self._migrate_legacy_data_sync)
 
         # 加载命令数据
-        self._data_manager.load(self._plugin_dir)
+        self._data_manager.load(self._data_dir)
 
         # 清洗历史/手工编辑残留的"幽灵命令"：命中内置命令保留词的 trigger 永远无法
         # 被动态触发（hook 见到会让位给精确 @Command），留在库里只会污染 .列表 输出。
@@ -152,7 +216,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         # 缓存管理员集合
         self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
 
-        # 确保图片目录存在（基于插件目录解析，避免依赖文件夹的具体名称）
+        # 确保图片目录存在（基于持久数据目录解析，避免依赖文件夹的具体名称）
         try:
             self._images.resolve_dir().mkdir(parents=True, exist_ok=True)
         except OSError as e:

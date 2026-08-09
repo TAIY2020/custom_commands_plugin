@@ -7,6 +7,7 @@ __pycache__/
 
 # 本地运行配置与用户数据
 config.toml
+config_back/
 custom_commands.json
 custom_commands.json.tmp
 images/
