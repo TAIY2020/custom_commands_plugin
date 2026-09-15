@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,20 @@ def looks_like_image_response(response: str) -> bool:
     return response.lower().endswith(IMAGE_EXTENSIONS) and not any(c.isspace() for c in response)
 
 
+def is_persistable_text(value: str) -> bool:
+    """字符串能否按 UTF-8 落盘。
+
+    JSON 里的 ``\\udXXX`` 转义能被 ``json.load`` 还原成孤立代理项，这类字符串在
+    ``json.dump(ensure_ascii=False)`` 写盘时会抛 ``UnicodeEncodeError``；添加与加载时
+    都用本函数拦截，避免内存已改、磁盘写不进去。
+    """
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 # --- 命令关键字 ---
 
 # Command pattern 中前缀占位符——装饰器声明阶段无法访问 self.config，
@@ -92,6 +109,151 @@ KW_ADD_ANSWER = "答："  # add 命令中 trigger 与 response 的分隔符
 KW_DELETE = "删："
 KW_DELETE_GLOBAL = "删全局："
 KW_LIST = "列表"
+
+
+# --- 内置命令 pattern（占位符形态）---
+
+# 四个内置命令的正则单一来源：@Command 装饰器声明与「纯文本段重新匹配」共用。
+# response 段用 [\s\S]+ 而非 .+：Host 编译命令正则是 re.compile(pattern) 且不带 re.DOTALL，
+# .+ 不跨行会让「答：」后含换行的多行回复整体失配；trigger 段仍用 .+? 保持单行。
+BUILTIN_PATTERN_ADD = (
+    rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_ADD)}(?P<trigger>.+?)"
+    rf"{re.escape(KW_ADD_ANSWER)}(?P<response>[\s\S]+)$"
+)
+BUILTIN_PATTERN_DELETE = rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_DELETE)}(?P<trigger>.+)$"
+BUILTIN_PATTERN_DELETE_GLOBAL = rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_DELETE_GLOBAL)}(?P<trigger>.+)$"
+BUILTIN_PATTERN_LIST = rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_LIST)}$"
+
+# kind → 占位符 pattern。顺序即「纯文本重新匹配」的尝试顺序：delete_global 须先于 delete，
+# 虽然「删全局：」与「删：」并不互为前缀，但显式排序可防未来关键字调整后产生歧义。
+BUILTIN_PATTERNS: Dict[str, str] = {
+    "add": BUILTIN_PATTERN_ADD,
+    "delete_global": BUILTIN_PATTERN_DELETE_GLOBAL,
+    "delete": BUILTIN_PATTERN_DELETE,
+    "list": BUILTIN_PATTERN_LIST,
+}
+
+
+def compile_builtin_patterns(prefix: str) -> Dict[str, "re.Pattern[str]"]:
+    """把占位符 pattern 按实际前缀编译成正则，供纯文本段重新匹配使用。"""
+    escaped = re.escape(prefix)
+    return {
+        kind: re.compile(pattern.replace(PREFIX_PLACEHOLDER, escaped, 1))
+        for kind, pattern in BUILTIN_PATTERNS.items()
+    }
+
+
+# --- 入站消息段解析 ---
+
+
+def extract_text_and_images(raw_message: Any) -> Tuple[str, List[Dict[str, Any]]]:
+    """从 raw_message 段列表中拼接纯文本、收集图片段。
+
+    不依赖 processed_plain_text——后者会把引用消息原文、@昵称、图片占位符一并渲染进去
+    并用空格拼接（Host message.py::process），拿它做命令匹配会让被引用消息的内容参与匹配。
+    这里只认 text 段原文与 image/emoji 段。
+    """
+    text_parts: List[str] = []
+    image_segs: List[Dict[str, Any]] = []
+    if isinstance(raw_message, list):
+        for seg in raw_message:
+            if not isinstance(seg, dict):
+                continue
+            seg_type = seg.get("type")
+            if seg_type == "text":
+                data = seg.get("data")
+                if isinstance(data, str):
+                    text_parts.append(data)
+                elif isinstance(data, dict):
+                    text = data.get("text")
+                    if isinstance(text, str):
+                        text_parts.append(text)
+            elif seg_type in ("image", "emoji"):
+                image_segs.append(seg)
+    return "".join(text_parts), image_segs
+
+
+# --- 消息路由上下文 ---
+
+# 两个 QQ 适配器的插件 ID。它们把 API 都注册在 adapter.napcat.* 短名下，同时启用时短名调用
+# 会被 Host 判为「API 名称不唯一」，必须用 <plugin_id>.<短名> 全名调用。
+ADAPTER_PLUGIN_NAPCAT = "maibot-team.napcat-adapter"
+ADAPTER_PLUGIN_SNOWLUMA = "maibot-team.snowluma-adapter"
+
+# 与 Host platform_io/route_key_factory.py::RouteKeyFactory 的取键顺序保持一致。
+_ACCOUNT_ID_KEYS = ("platform_io_account_id", "account_id", "self_id", "bot_account")
+_SCOPE_KEYS = ("platform_io_scope", "route_scope", "adapter_scope", "connection_id")
+
+
+@dataclass(frozen=True)
+class MessageRoute:
+    """一条入站消息的路由上下文：发往哪个会话、经由哪个适配器/账号。"""
+
+    stream_id: str = ""
+    platform: str = "qq"
+    group_id: str = ""
+    user_id: str = ""
+    account_id: str = ""
+    scope: str = ""
+    adapter_plugin_id: str = ""  # 识别不出来源适配器时为空，调用方退回短名
+
+    @property
+    def chat_type(self) -> str:
+        return "group" if self.group_id else "private"
+
+
+def _pick_string(mapping: Dict[str, Any], keys: Tuple[str, ...]) -> str:
+    for key in keys:
+        value = mapping.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def resolve_adapter_plugin_id(additional_config: Any) -> str:
+    """按 additional_config 的适配器专有字段判断消息来源。
+
+    SnowLuma 在 notice 上也会写 napcat_notice_* 兼容字段，故先判 snowluma_* 再判 napcat_*；
+    普通消息两家分别只写 snowluma_message_type / napcat_message_type。
+    """
+    if not isinstance(additional_config, dict):
+        return ""
+    if "snowluma_message_type" in additional_config or "snowluma_notice_type" in additional_config:
+        return ADAPTER_PLUGIN_SNOWLUMA
+    if "napcat_message_type" in additional_config or "napcat_notice_type" in additional_config:
+        return ADAPTER_PLUGIN_NAPCAT
+    return ""
+
+
+def build_message_route(
+    message: Optional[Dict[str, Any]],
+    *,
+    stream_id: str = "",
+    group_id: str = "",
+    user_id: str = "",
+) -> MessageRoute:
+    """从 Host 下发的 message dict 构造路由上下文；显式入参优先于 message 内字段。"""
+    msg = message if isinstance(message, dict) else {}
+    msg_info = msg.get("message_info") or {}
+    if not isinstance(msg_info, dict):
+        msg_info = {}
+    user_info = msg_info.get("user_info") or {}
+    group_info = msg_info.get("group_info") or {}
+    additional = msg_info.get("additional_config") or {}
+    if not isinstance(additional, dict):
+        additional = {}
+    return MessageRoute(
+        stream_id=str(stream_id or msg.get("session_id") or ""),
+        platform=str(msg.get("platform") or "qq"),
+        group_id=str(group_id or (group_info.get("group_id") if isinstance(group_info, dict) else "") or ""),
+        user_id=str(user_id or (user_info.get("user_id") if isinstance(user_info, dict) else "") or ""),
+        account_id=_pick_string(additional, _ACCOUNT_ID_KEYS),
+        scope=_pick_string(additional, _SCOPE_KEYS),
+        adapter_plugin_id=resolve_adapter_plugin_id(additional),
+    )
 
 
 # --- 保留词判断 ---

@@ -3,6 +3,10 @@
 ``ImageStore`` 持 plugin 弱引用，经 ``self._plugin.config`` / ``ctx`` / ``_plugin_dir``
 访问依赖。封装一条咬合的链：image_directory 解析 → 路径穿越防御 → 内容 hash 落盘
 （同图去重）→ 孤儿回收 → 读盘 base64 编码 → 把图片回复发出去（含各类失败回执）。
+
+文件身份：托管文件（``cc_<hash>.<ext>``）在引用比较、文件级锁、孤儿判定与最终删除四处
+统一使用 ``canonical_managed_name`` 规范化后的纯文件名，``./cc_x.png`` / ``CC_X.PNG`` /
+``<image_dir>/cc_x.png`` 都视为同一文件；删除路径在数据写锁内、按删除时刻的目录配置计算。
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Tuple
 
-from .common import IMAGE_EXTENSIONS
+from .common import IMAGE_EXTENSIONS, looks_like_image_response
 
 if TYPE_CHECKING:
     from ..plugin import CustomCommandsPlugin
@@ -31,20 +35,48 @@ logger = logging.getLogger(__name__)
 _MANAGED_IMAGE_FILE_RE = re.compile(r"^cc_[0-9a-f]{16}\.(?:png|jpe?g|gif|webp)$")
 
 
+def normalize_relative_image_path(value: str) -> str:
+    """回复内容里的图片路径做纯字符串规范化：去首尾空白、统一分隔符、折叠 ``./`` 与 ``sub/..``。
+
+    不碰文件系统。所有"文件身份"判断（托管名识别、引用键、锁键、清理）都先经此函数，
+    保证 ``cc_x.png`` / ``./cc_x.png`` / ``sub/../cc_x.png`` 得到同一结果。
+    """
+    text = (value or "").strip().replace("\\", "/")
+    if not text:
+        return ""
+    return os.path.normpath(text)
+
+
+def canonical_managed_name(value: str) -> Optional[str]:
+    """把回复内容规范成托管文件名；非托管文件返回 None。纯字符串运算，不碰文件系统。
+
+    ``./cc_x.png``、``.\\cc_x.png``、``sub/../cc_x.png``、``CC_X.PNG`` → ``cc_x.png``。
+    规范化后仍含目录分量的一律视为非托管（托管文件永远直接落在 image_directory 根下）。
+    """
+    normalized = normalize_relative_image_path(value)
+    if not normalized or os.sep in normalized or "/" in normalized:
+        return None
+    lowered = normalized.lower()
+    return lowered if _MANAGED_IMAGE_FILE_RE.match(lowered) else None
+
+
 class ImageStore:
     """图片资源的安全存取与投递。"""
 
     def __init__(self, plugin: "CustomCommandsPlugin") -> None:
         self._plugin = plugin
-        # 托管图片的文件级锁，按文件名串行化同一 hash 图片的保存/绑定/清理；配套使用者计数，
+        # 托管图片的文件级锁，按规范化文件名串行化同一 hash 图片的保存/绑定/清理；配套使用者计数，
         # 在最后一个使用者退出后连同锁一并回收，避免该表随历史上出现过的不同图片无界增长。
         self._managed_file_locks: dict[str, asyncio.Lock] = {}
         self._managed_file_lock_users: dict[str, int] = {}
         self._warned_absolute_image_dir: str = ""
+        # resolve_dir 结果缓存：键为 (配置值, 数据目录)，配置热更新改了 image_directory 键即失效。
+        # Path.resolve() 在网络盘上是多次系统调用，引用比较/清理/发送都会用到目录，不能每次都解析。
+        self._resolved_dir_cache: Optional[Tuple[Tuple[str, str], Path]] = None
 
     @asynccontextmanager
     async def managed_file_lock(self, filename: str) -> AsyncIterator[None]:
-        """同一托管图片文件的保存、命令绑定与孤儿清理必须共用这把锁。
+        """同一托管图片文件的保存、命令绑定与孤儿清理必须共用这把锁（按规范化文件名）。
 
         锁按需创建并做使用者计数：进入时登记、退出时注销，计数归零即连同锁一起从表中移除，
         使 ``_managed_file_locks`` 不会随出现过的不同图片无界增长。计数的增减都在 await 边界
@@ -52,27 +84,35 @@ class ImageStore:
         不可分割：等待同一把锁的后到协程必然已先完成登记，计数不会在仍有等待者时归零，因此
         不存在"锁被提前回收、后到协程另建新锁导致失去互斥"的竞态。
         """
-        lock = self._managed_file_locks.get(filename)
+        key = canonical_managed_name(filename) or filename
+        lock = self._managed_file_locks.get(key)
         if lock is None:
             lock = asyncio.Lock()
-            self._managed_file_locks[filename] = lock
-        self._managed_file_lock_users[filename] = self._managed_file_lock_users.get(filename, 0) + 1
+            self._managed_file_locks[key] = lock
+        self._managed_file_lock_users[key] = self._managed_file_lock_users.get(key, 0) + 1
         try:
             async with lock:
                 yield
         finally:
-            remaining = self._managed_file_lock_users.get(filename, 0) - 1
+            remaining = self._managed_file_lock_users.get(key, 0) - 1
             if remaining > 0:
-                self._managed_file_lock_users[filename] = remaining
+                self._managed_file_lock_users[key] = remaining
             else:
-                self._managed_file_lock_users.pop(filename, None)
-                self._managed_file_locks.pop(filename, None)
+                self._managed_file_lock_users.pop(key, None)
+                self._managed_file_locks.pop(key, None)
+
+    # ===== 目录与路径 =====
 
     def resolve_dir(self) -> Path:
-        """将配置中的 image_directory 解析为绝对 Path。
+        """将配置中的 image_directory 解析为绝对 Path（带缓存）。
         相对路径基于插件持久数据目录（ctx.paths.data_dir）解析，绝对路径直接使用。
         """
         configured = self._plugin.config.settings.image_directory
+        base_dir = self._plugin._data_dir or self._plugin._plugin_dir or str(Path.cwd())
+        cache_key = (configured, base_dir)
+        if self._resolved_dir_cache is not None and self._resolved_dir_cache[0] == cache_key:
+            return self._resolved_dir_cache[1]
+
         path = Path(configured)
         if path.is_absolute():
             normalized = str(path)
@@ -82,33 +122,73 @@ class ImageStore:
                     normalized,
                 )
                 self._warned_absolute_image_dir = normalized
-        if not path.is_absolute():
-            base = Path(self._plugin._data_dir or self._plugin._plugin_dir or Path.cwd())
-            path = base / path
-        return path.resolve()
+        else:
+            path = Path(base_dir) / path
+        resolved = path.resolve()
+        self._resolved_dir_cache = (cache_key, resolved)
+        return resolved
 
-    def safe_path(self, response: str) -> Optional[Path]:
-        """将回复内容解析为 image_directory 内的安全路径。
+    def safe_path(self, response: str, *, allow_links: bool = True) -> Optional[Path]:
+        """将回复内容解析为 image_directory 内的安全路径（用于读取/存在性检查）。
+
+        ``resolve()`` 会跟随符号链接，故指向目录外的链接会被 ``relative_to`` 拒绝。
+        新增引用使用 ``allow_links=False``，拒绝文件链接和目录链接；历史引用仍可读取，
+        孤儿清理另做实际文件身份复核，不自动改写历史命令。
+        删除操作不要用本方法返回的路径（会删到链接目标），见 ``cleanup_orphan_locked``。
 
         Returns:
             合法时返回解析后的绝对 Path；包含路径穿越或越界时返回 None。
         """
         image_base_dir = self.resolve_dir()
-        image_path = (image_base_dir / response).resolve()
+        unresolved_path = image_base_dir / response
+        image_path = unresolved_path.resolve()
         try:
             image_path.relative_to(image_base_dir)
         except ValueError:
             return None
+        if not allow_links:
+            for candidate in (unresolved_path, *unresolved_path.parents):
+                if candidate == image_base_dir:
+                    break
+                is_junction = getattr(candidate, "is_junction", None)
+                if candidate.is_symlink() or (is_junction is not None and is_junction()):
+                    return None
         return image_path
 
-    @staticmethod
-    def _is_managed_file(value: str) -> bool:
-        """判断回复内容是否为带图添加自动落盘的图片文件名。
+    def _strip_base_dir(self, value: str) -> str:
+        """绝对路径若落在当前图片目录内，剥掉目录前缀得到相对写法；相对路径原样返回。
 
-        仅匹配 ``cc_<hash><ext>`` 这类插件生成的文件；用户手动放进 image_directory
-        的图片（如 ``hello.png``）不匹配，避免孤儿回收误删用户自带资源。
+        目录来自 ``resolve_dir()`` 的缓存（配置不变时不碰文件系统）。
         """
-        return bool(_MANAGED_IMAGE_FILE_RE.match(value or ""))
+        text = (value or "").strip()
+        if not text or not os.path.isabs(text):
+            return text
+        base = os.path.normcase(str(self.resolve_dir()))
+        normalized = os.path.normcase(os.path.normpath(text))
+        prefix = base if base.endswith(os.sep) else base + os.sep
+        if normalized.startswith(prefix):
+            return normalized[len(prefix):]
+        return text
+
+    def reference_key(self, value: str) -> str:
+        """回复内容的引用比较键，供 ``CommandDataManager._is_referenced`` 使用。
+
+        纯字符串运算（配置不变时不解析文件系统，可在写锁内对全库逐条调用）：
+        - 非图片回复：键即自身。
+        - 托管图片：``managed:<规范化文件名>``，``cc_x.png`` / ``./cc_x.png`` / ``sub/../cc_x.png`` /
+          绝对路径写法同键。
+        - 其它图片：``img:<normcase(规范化相对路径)>``，兼容 Windows 大小写与分隔符差异。
+        前缀保证图片键永远不会与某条纯文本回复碰撞。
+        """
+        if not looks_like_image_response(value):
+            return value
+        relative = self._strip_base_dir(value)
+        managed = canonical_managed_name(relative)
+        if managed is not None:
+            return "managed:" + managed
+        return "img:" + os.path.normcase(normalize_relative_image_path(relative))
+
+    # ===== 图片格式 =====
 
     @staticmethod
     def guess_extension(data: bytes, url_hint: str = "") -> str:
@@ -146,20 +226,31 @@ class ImageStore:
         )
 
     def managed_filename_for(self, data: bytes, url_hint: str = "") -> str:
-        """按图片内容生成托管文件名，供调用方在保存前先获取文件级锁。"""
+        """按图片内容生成托管文件名（已是规范形态），供调用方在保存前先获取文件级锁。"""
         ext = self.guess_extension(data, url_hint)
         digest = hashlib.sha256(data).hexdigest()[:16]
         return f"cc_{digest}{ext}"
 
-    def _save_bytes_sync(self, data: bytes, filename: str) -> str:
-        """把图片字节落盘到 image_directory，文件名按内容 hash 生成（同图去重）。
+    # ===== 落盘 =====
+
+    def _save_bytes_sync(self, data: bytes, filename: str, image_dir: Path) -> str:
+        """把图片字节落盘到 ``image_dir``，文件名按内容 hash 生成（同图去重）。
 
         同步 I/O，须经 asyncio.to_thread 调用。返回相对文件名（存入 commands 作 response）。
         采用"临时文件 + 原子重命名"，避免写入中途崩溃留下半截文件。
+        ``image_dir`` 由调用方在事件循环里解析后传入，调用方据此知道文件实际落在哪个目录，
+        绑定命令前可与当时的目录配置比对（目录热更新期间的在途保存不会被静默绑定到旧目录）。
+
+        目标已是普通文件（非符号链接）且内容与本次输入逐字节一致时跳过重写：文件名由内容
+        hash 决定，正常情况下同名即同内容，重写只是无谓 I/O，且 Windows 下若恰有
+        dispatch_response 正在读同一文件，replace 会撞上共享冲突。仅凭 exists() 不够——现有
+        文件可能被手动替换或损坏，故须比对内容；符号链接不复用，replace 会把链接本身换成
+        独立普通文件，不触碰链接目标。
         """
-        image_dir = self.resolve_dir()
         image_dir.mkdir(parents=True, exist_ok=True)
         target = image_dir / filename
+        if self._is_identical_regular_file(target, data):
+            return filename
         # 临时文件名加入随机后缀，避免同图并发保存时多个任务争用同一个 .tmp。
         tmp_path = image_dir / f".{filename}.{uuid.uuid4().hex}.tmp"
         try:
@@ -176,9 +267,106 @@ class ImageStore:
             raise
         return filename
 
-    async def store_prepared(self, image_bytes: bytes, filename: str) -> str:
-        """在调用方已持有 ``managed_file_lock(filename)`` 时落盘指定托管文件名。"""
-        return await asyncio.to_thread(self._save_bytes_sync, image_bytes, filename)
+    @staticmethod
+    def _is_identical_regular_file(target: Path, data: bytes) -> bool:
+        """``target`` 是否为非链接的普通文件且内容与 ``data`` 完全一致（大小先筛，再逐字节比对）。"""
+        try:
+            if target.is_symlink() or not target.is_file():
+                return False
+            if target.stat().st_size != len(data):
+                return False
+            return target.read_bytes() == data
+        except OSError:
+            return False
+
+    async def store_prepared(self, image_bytes: bytes, filename: str) -> Tuple[str, Path]:
+        """在调用方已持有 ``managed_file_lock(filename)`` 时落盘指定托管文件名。
+
+        Returns:
+            (文件名, 实际写入的图片目录)。调用方在绑定命令前应比对该目录与当时的
+            ``resolve_dir()``，不一致说明保存期间配置被热更新。
+        """
+        image_dir = self.resolve_dir()
+        saved = await asyncio.to_thread(self._save_bytes_sync, image_bytes, filename, image_dir)
+        return saved, image_dir
+
+    # ===== 孤儿回收 =====
+
+    @staticmethod
+    def _has_resolved_reference_sync(
+        image_directory: Path, candidate_path: Path, responses: Tuple[str, ...],
+    ) -> bool:
+        """只在字符串引用判定为孤儿后复核实际目标；解析失败时保守保留文件。"""
+        try:
+            # 非严格解析可能吞掉访问拒绝并返回未解析路径，不能据此断言两个文件不同。
+            resolved_candidate = candidate_path.resolve(strict=True)
+            for response in responses:
+                if not looks_like_image_response(response):
+                    continue
+                try:
+                    resolved_reference = (image_directory / response).resolve(strict=True)
+                except FileNotFoundError:
+                    # 允许先建命令再放图片；确定不存在的路径不引用这个已经存在的候选文件。
+                    continue
+                if resolved_reference == resolved_candidate:
+                    return True
+        except (OSError, RuntimeError, ValueError) as exc:
+            logger.warning("无法确认图片 %s 的全部历史引用，跳过清理: %s", candidate_path.name, exc)
+            return True
+        return False
+
+    async def cleanup_orphan_locked(
+        self, filename: str, data_manager: Any, *, file_lock_held: bool = False,
+    ) -> None:
+        """孤儿回收：在数据写锁内原子完成"判断无引用 → 删除"。
+
+        只回收插件托管（``cc_<hash>``）的文件，文件身份先经 ``canonical_managed_name``
+        规范化：``./cc_x.png`` 这类别名作为最后一条引用被删除时同样能回收。
+        把文件级锁、引用判断与删除合并起来：先串行化同一文件名的保存/绑定/清理，再在
+        ``data_manager`` 的写锁内执行 ``cleanup_if_unreferenced``，消除并发添加同一张图时
+        "判断未引用"与"删除"之间被插入引用而误删的 TOCTOU 窗口。
+        目录在本次操作中固定；异步复核历史链接时持数据锁，随后复查代际和目录是否变化。
+        复核放在线程池里，常规字符串引用扫描不做文件系统查询。目标自身是链接时仍跳过删除。
+        """
+        image_directory = self.resolve_dir()
+        canonical = canonical_managed_name(self._strip_base_dir(filename)) if filename else None
+        if canonical is None:
+            return
+        image_path = image_directory / canonical
+
+        async def _cleanup_after_file_lock() -> None:
+            async def _has_other_reference(responses: Tuple[str, ...]) -> bool:
+                return await asyncio.to_thread(
+                    self._has_resolved_reference_sync, image_directory, image_path, responses,
+                )
+
+            def _unlink() -> bool:
+                if self.resolve_dir() != image_directory:
+                    logger.info("图片目录已变更，放弃本次孤儿清理: %s", canonical)
+                    return False
+                try:
+                    if image_path.is_symlink():
+                        logger.warning("孤儿图片 '%s' 是符号链接，跳过删除以免误删链接目标", canonical)
+                        return False
+                    image_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("清理孤儿图片文件 '%s' 失败: %s", canonical, exc)
+                    return False
+                return True
+
+            deleted = await data_manager.cleanup_if_unreferenced(
+                canonical, _unlink, additional_reference_check=_has_other_reference,
+            )
+            if deleted:
+                logger.info("已清理无引用的孤儿图片文件: %s", canonical)
+
+        if file_lock_held:
+            await _cleanup_after_file_lock()
+            return
+        async with self.managed_file_lock(canonical):
+            await _cleanup_after_file_lock()
+
+    # ===== 投递 =====
 
     async def _send_error_text(self, text: str, stream_id: str, *, context: str) -> bool:
         """发送图片错误提示并吞掉发送异常，避免错误路径再次抛出。"""
@@ -189,43 +377,9 @@ class ImageStore:
             return False
         if send_ok is False:
             logger.warning("%s发送失败：send.text 返回 False（可能被风控或连接异常）", context)
+            self._plugin._service.note_send_failure(stream_id)
             return False
         return True
-
-    async def cleanup_orphan_locked(
-        self, filename: str, data_manager: Any, *, file_lock_held: bool = False,
-    ) -> None:
-        """带图添加超限失败时的孤儿回收：在数据写锁内原子完成"判断无引用 → 删除"。
-
-        只回收插件托管（``cc_<hash>``）且路径安全的文件，并把文件级锁、引用判断与删除
-        合并起来：先串行化同一文件名的保存/绑定/清理，再在
-        ``data_manager`` 的写锁内执行 ``cleanup_if_unreferenced``，消除并发添加同一张图时
-        "判断未引用"与"删除"之间被插入引用而误删的 TOCTOU 窗口。删除失败仅记日志。
-        ``data_manager`` 即 ``CommandDataManager`` 实例（duck typing，仅调 cleanup_if_unreferenced）。
-        """
-        if not filename or not self._is_managed_file(filename):
-            return
-        image_path = self.safe_path(filename)
-        if image_path is None:
-            return
-
-        async def _cleanup_after_file_lock() -> None:
-            def _unlink() -> None:
-                # 删除在写锁内同步执行（单文件 unlink 极快）；自吞 OSError 不让异常穿透写锁。
-                try:
-                    image_path.unlink(missing_ok=True)
-                except OSError as exc:
-                    logger.warning("清理孤儿图片文件 '%s' 失败: %s", filename, exc)
-
-            deleted = await data_manager.cleanup_if_unreferenced(filename, _unlink)
-            if deleted:
-                logger.info("已清理无引用的孤儿图片文件: %s", filename)
-
-        if file_lock_held:
-            await _cleanup_after_file_lock()
-            return
-        async with self.managed_file_lock(filename):
-            await _cleanup_after_file_lock()
 
     @staticmethod
     def _read_and_encode_sync(
@@ -309,6 +463,7 @@ class ImageStore:
         # 其余返回形态（True / 兼容旧 Host 的原始结果）按成功处理，不误报。
         if send_ok is False:
             logger.warning("发送动态图片失败：send.image 返回 False（可能被风控或格式不受支持）")
+            p._service.note_send_failure(stream_id)
             await self._send_error_text(
                 "❌ 图片发送失败，可能被风控或格式不受支持", stream_id,
                 context="图片发送失败提示",

@@ -2,6 +2,13 @@
 
 ``CommandDataManager`` 只关心已解析的作用域名 + 数据；作用域解析由 ``ScopeResolver``
 在调用方完成。不依赖 SDK ctx，可独立测试。
+
+写入约束（``ensure_writable`` / ``cleanup_if_unreferenced`` 共用）三层：
+1. **保护模式**：数据文件加载失败，拒绝覆盖用户仍可手工修复的原文件。
+2. **退役**：on_unload 做完最终保存后置位，超过排空期限仍在跑的旧任务不能再改数据。
+3. **代际**：每次 on_load 递增 ``generation``；每个入口（hook / Command / 后台任务）把进入时的
+   代际绑进 contextvar，写入与清理时校验。重载失败回滚会对同一个实例再次 on_load 并解除退役，
+   若只靠退役布尔值，卸载前开始的旧任务会在回滚后重新获得写权限；代际校验把它们挡住。
 """
 
 from __future__ import annotations
@@ -13,16 +20,37 @@ import os
 import shutil
 import time
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, Iterator, List, Optional, Tuple
 
-from .common import DEFAULT_MAX_COMMANDS_PER_SCOPE
+from .common import DEFAULT_MAX_COMMANDS_PER_SCOPE, is_persistable_text
 
 logger = logging.getLogger(__name__)
 
+# 当前执行流所属的插件代际；None 表示未绑定（不做代际校验）。
+ACTIVE_GENERATION: ContextVar[Optional[int]] = ContextVar("custom_commands_generation", default=None)
+
 
 class DataProtectionError(RuntimeError):
-    """命令数据文件加载失败后进入保护模式，拒绝继续覆盖原文件。"""
+    """命令数据当前拒绝写入：保护模式、实例已退役，或本次操作所属代际已过期。"""
+
+
+class DataSaveError(OSError):
+    """序列化或写盘失败（含 ``UnicodeEncodeError`` 等编码错误）。
+
+    继承 ``OSError`` 使 ``add``/``delete`` 的「保存失败即回滚」分支与业务层的
+    「未生效，请重试」回执对编码错误同样生效，不再被误归入配额错误。
+    """
+
+
+class CommandQuotaError(ValueError):
+    """作用域命令数达到上限。独立类型，避免与其它 ``ValueError`` 混淆。"""
+
+
+class StaleResourceError(RuntimeError):
+    """写入前置条件不成立（如图片已落盘的目录与当前配置不一致），本次提交作废。"""
 
 
 class CommandDataManager:
@@ -42,27 +70,92 @@ class CommandDataManager:
         # 加载已存在文件时发生解析/读取失败 → True。此时内存被重置为空库，若再落盘会覆盖
         # 用户原始（可能只是手工编辑出错、仍可修复）的数据，故运行期写入与卸载保存都要拒绝。
         self._load_failed = False
+        # 实例退役：on_unload 做完最终保存后置位。单插件重载在 Runner 进程内完成且不等待在途
+        # 任务，旧实例上超过排空期限仍在跑的带图添加若继续写入，会在新实例加载快照之后落盘、
+        # 再被新实例的下一次保存覆盖。退役后一切写入与清理都被拒绝，业务层回执"请重试"。
+        self._retired = False
+        # 代际：begin_generation() 每次 on_load 递增；见模块 docstring 第 3 层约束。
+        self._generation = 0
+        # 回复内容的引用比较键：图片回复 "cc_x.png" 与 "./cc_x.png" 指向同一文件，按原始字符串
+        # 比较会把仍被引用的图片误判成孤儿。由调用方（ImageStore）注入规范化函数；未注入时按原样比较。
+        self._value_key: Callable[[str], str] = lambda value: value
+
+    def set_value_normalizer(self, normalizer: Callable[[str], str]) -> None:
+        """注入回复内容的引用比较键函数（同一文件的不同写法应映射到同一键）。"""
+        self._value_key = normalizer
+
+    # ===== 状态 =====
 
     @property
     def is_protected(self) -> bool:
         """命令数据是否因加载失败进入保护模式。"""
         return self._load_failed
 
-    def _ensure_writable(self) -> None:
-        """保护模式下拒绝任何会覆盖 custom_commands.json 的写入。"""
+    @property
+    def is_retired(self) -> bool:
+        """实例是否已退役（正在重载/卸载）。"""
+        return self._retired
+
+    @property
+    def generation(self) -> int:
+        """当前代际号。"""
+        return self._generation
+
+    def begin_generation(self) -> int:
+        """on_load 起始调用：开启新代际并解除退役。旧代际绑定的执行流此后写入全部被拒。"""
+        self._generation += 1
+        self._retired = False
+        return self._generation
+
+    @contextmanager
+    def bind_generation(self, generation: Optional[int] = None) -> Iterator[int]:
+        """把 ``generation``（默认当前代际）绑到当前执行流；退出时还原。
+
+        入口（hook / Command handler）在同步位置调用可覆盖其内直接 await 的业务；
+        后台任务须在协程体内用捕获值再绑一次——任务上下文是创建时的副本，不随外层还原。
+        """
+        bound = self._generation if generation is None else generation
+        token = ACTIVE_GENERATION.set(bound)
+        try:
+            yield bound
+        finally:
+            ACTIVE_GENERATION.reset(token)
+
+    def _writable_reason(self) -> Optional[str]:
+        """当前拒绝写入/清理的原因；可写时返回 None。文案可直接回执给用户。"""
+        if self._retired:
+            return "插件正在重载或卸载，本次修改未保存，请稍后重试"
+        bound = ACTIVE_GENERATION.get()
+        if bound is not None and bound != self._generation:
+            return "插件已重载，本次操作已过期，请重新发送"
         if self._load_failed:
-            raise DataProtectionError(
+            return (
                 "命令数据文件加载失败，已进入保护模式；"
                 "请先修复 custom_commands.json 后重载插件，再修改命令"
             )
+        return None
 
-    def load(self, data_dir: str) -> None:
-        """从 ``data_dir``（插件持久数据目录）加载命令数据文件，包含深层数据校验。
+    def ensure_writable(self) -> None:
+        """当前拒绝写入时抛 ``DataProtectionError``。"""
+        reason = self._writable_reason()
+        if reason is not None:
+            raise DataProtectionError(reason)
 
-        已存在文件解析/读取失败、或 JSON 能解析但结构语义异常（顶层非 dict、或任一作用域
-        非 dict/含非字符串键值）时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，再置
-        ``_load_failed``（结构异常时仍保留可识别的合法作用域到内存）；据此 ``save_locked``
-        （on_unload 收尾）会跳过保存，避免清洗/重置后的内存静默覆盖用户仍可手工修复的原始数据。
+    # ===== 加载 =====
+
+    def load(self, data_dir: str, *, create_if_missing: bool = True) -> None:
+        """从 ``data_dir``（插件持久数据目录）加载命令数据文件，包含深层数据校验（同步）。
+
+        已存在文件解析/读取失败、或 JSON 能解析但结构语义异常（顶层非 dict、作用域名或
+        任一键值非字符串或不可按 UTF-8 落盘）时：先把原文件备份成 ``*.corrupt.<时间戳>.bak``，
+        再置 ``_load_failed``（结构异常时仍保留可识别的合法作用域到内存）；据此卸载时的
+        最终保存会跳过，避免清洗/重置后的内存静默覆盖用户仍可手工修复的原始数据。
+
+        ``create_if_missing=False`` 用于「旧数据迁移失败」场景：此时目标文件不存在不是首次
+        安装，而是旧数据没能搬过来；若照常新建空库，下次启动迁移会因目标已存在而永久跳过。
+        该情况下直接进入保护模式，内存为空库、拒绝落盘，等待下次启动重试迁移。
+
+        本方法不碰退役/代际状态（由 ``begin_generation`` 负责）。运行期请用 ``load_async``。
         """
         self.file_path = Path(data_dir) / "custom_commands.json"
         self._load_failed = False
@@ -71,6 +164,14 @@ class CommandDataManager:
         # 且若据此禁止保存，用户将永远无法落盘任何命令。
         if not self.file_path.exists():
             self.commands = {"global": {}}
+            if not create_if_missing:
+                self._load_failed = True
+                logger.error(
+                    "命令数据文件 '%s' 不存在且本次不允许新建（旧数据迁移未成功），"
+                    "已进入保护模式：本次运行内存为空库、拒绝落盘，下次启动将重试迁移",
+                    self.file_path.name,
+                )
+                return
             try:
                 self._save_sync()
                 logger.info("未找到 '%s'，已创建新文件", self.file_path.name)
@@ -79,10 +180,11 @@ class CommandDataManager:
             return
 
         # 文件存在：读取 + 解析。失败则备份原文件并标记 _load_failed，保护原始数据。
+        # ValueError 同时涵盖 JSONDecodeError 与 UnicodeDecodeError（文件含无效 UTF-8 字节）。
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.error(
                 "加载 '%s' 失败: %s；已备份原文件，卸载时将不会自动保存以免覆盖",
                 self.file_path.name, e,
@@ -92,11 +194,7 @@ class CommandDataManager:
             self.commands = {"global": {}}
             return
 
-        # 深层校验：必须是 Dict[str, Dict[str, str]]。
-        # 关键：JSON 能解析但语义结构不符（顶层非 dict、或任一作用域非 dict/含非字符串键值）
-        # 时，同样视为"文件已非插件干净格式"——备份原文件并置 _load_failed，让 on_unload 的
-        # save_locked 跳过自动保存，避免用"清洗/重置后的版本"静默覆盖用户仍可手工修复的原始
-        # 数据（与 JSONDecodeError/OSError 分支同一保护语义；此前这里只 warning 不保护是隐患）。
+        # 深层校验：必须是 Dict[str, Dict[str, str]]，作用域名与每个键值都可按 UTF-8 落盘。
         if not isinstance(data, dict):
             logger.error(
                 "命令数据顶层结构异常（非字典），已备份原文件并进入保护模式，"
@@ -110,14 +208,16 @@ class CommandDataManager:
         validated: Dict[str, Dict[str, str]] = {}
         has_corrupt_scope = False
         for scope_key, scope_val in data.items():
-            if isinstance(scope_val, dict) and all(
+            scope_ok = isinstance(scope_key, str) and is_persistable_text(scope_key)
+            if scope_ok and isinstance(scope_val, dict) and all(
                 isinstance(k, str) and isinstance(v, str)
+                and is_persistable_text(k) and is_persistable_text(v)
                 for k, v in scope_val.items()
             ):
                 validated[scope_key] = scope_val
             else:
                 has_corrupt_scope = True
-                logger.warning("作用域 '%s' 数据格式异常，已跳过", scope_key)
+                logger.warning("作用域 %r 数据格式异常（名称或键值非字符串、或含无法落盘的字符），已跳过", scope_key)
         # 任一作用域被判损坏：合法作用域仍载入内存供本次运行使用，但备份原文件并进入保护
         # 模式，避免卸载自动保存时把损坏作用域从磁盘上静默抹掉（用户可能想手工修复它们）。
         if has_corrupt_scope:
@@ -134,6 +234,16 @@ class CommandDataManager:
             "成功加载 %d 条自定义命令 (涵盖 %d 个作用域)",
             total_cmds, len(self.commands),
         )
+
+    async def load_async(self, data_dir: str, *, create_if_missing: bool = True) -> None:
+        """持写锁、在线程池里执行 ``load``。
+
+        持锁：重载失败回滚后旧实例再激活时，超期未结束的旧任务可能仍持锁写 ``commands``，
+        与加载替换整库互斥。线程池：``open + json.load`` 在网络盘上可达百毫秒级，
+        on_load 也在运行期重载时执行，不能卡住同 Runner 的其他插件与 RPC。
+        """
+        async with self._lock:
+            await asyncio.to_thread(self.load, data_dir, create_if_missing=create_if_missing)
 
     def _backup_corrupt_file(self) -> None:
         """把无法解析的命令数据文件复制一份带时间戳的备份，保留原文件以便用户原地修复。
@@ -153,11 +263,17 @@ class CommandDataManager:
         except OSError as e:
             logger.error("备份损坏的命令数据文件失败: %s", e)
 
+    # ===== 保存 =====
+
     def _save_sync(self) -> None:
         """持久化命令数据到 JSON 文件（原子写入，同步版本）。
 
         使用"写临时文件 + 原子重命名"模式，防止写入过程中崩溃导致数据损坏。
-        仅在 load() 初始化时同步调用，运行时请使用 save()。
+        仅在 load() 初始化与 retire_and_save() 中直接调用，运行时请使用 save()。
+
+        Raises:
+            OSError: 写盘失败；序列化/编码失败以 ``DataSaveError``（OSError 子类）抛出，
+            使调用方的回滚与回执逻辑对两类失败一视同仁。
         """
         if not self.file_path:
             return
@@ -174,34 +290,47 @@ class CommandDataManager:
             tmp_path.replace(self.file_path)  # 原子替换
         except OSError as e:
             logger.error("保存命令数据失败: %s", e)
-            # 清理可能残留的临时文件
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
+            self._discard_tmp(tmp_path)
             # 向上抛出：调用方（add/delete）据此回滚内存改动，业务层据此向用户回报失败，
             # 避免"内存已改、磁盘没落、却提示成功"的静默数据不一致。
             raise
+        except (ValueError, TypeError) as e:
+            # UnicodeEncodeError（孤立代理项）等序列化失败：不属于 OSError，若不转换会绕过
+            # 临时文件清理与 add/delete 的内存回滚。
+            logger.error("序列化命令数据失败: %s", e)
+            self._discard_tmp(tmp_path)
+            raise DataSaveError("命令数据包含无法保存的字符") from e
+
+    @staticmethod
+    def _discard_tmp(tmp_path: Path) -> None:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     async def save(self) -> None:
         """持久化命令数据到 JSON 文件（异步版本，避免阻塞事件循环）。"""
-        self._ensure_writable()
+        self.ensure_writable()
         await asyncio.to_thread(self._save_sync)
 
-    async def save_locked(self) -> None:
-        """加锁后再保存——on_unload 收尾用。
+    async def retire_and_save(self) -> None:
+        """卸载收尾：在写锁内先退役、再做最终保存。
 
-        与 add/delete 共享同一把 ``_lock``，避免插件卸载时的最终 save 与
-        正在进行中的 add/delete 写操作 race 同一份 ``self.commands``。
+        退役标记与最终保存在同一临界区内完成，后到的任何 ``add``/``delete``（例如超过排空
+        期限仍在跑的旧任务）拿到锁后会先撞上 ``ensure_writable`` 而拒绝写入，不会在最终
+        快照之后再改内存或落盘。保护模式下跳过保存以免覆盖原文件，但同样退役。
         """
         async with self._lock:
+            self._retired = True
             if self._load_failed:
                 logger.warning(
                     "命令数据曾加载失败（内存为空库），跳过卸载保存以保护原文件；"
                     "请修复 custom_commands.json 后重载插件",
                 )
                 return
-            await self.save()
+            await asyncio.to_thread(self._save_sync)
+
+    # ===== 查询 =====
 
     def get(self, trigger: str, scope: str) -> Optional[str]:
         """获取命令回复（优先指定 scope，回退 global）。"""
@@ -211,21 +340,45 @@ class CommandDataManager:
             return self.commands["global"][trigger]
         return None
 
+    def has_global(self, trigger: str) -> bool:
+        """global 作用域是否存在某个 trigger（提示消息用，避免外部窥探 commands dict）。"""
+        return "global" in self.commands and trigger in self.commands["global"]
+
+    def get_triggers_for_scope(self, scope: str) -> List[str]:
+        """获取指定作用域下可见的所有触发词（本域独有 + global 共享），已排序。"""
+        triggers: set[str] = set()
+        if "global" in self.commands:
+            triggers.update(self.commands["global"].keys())
+        if scope in self.commands:
+            triggers.update(self.commands[scope].keys())
+        return sorted(triggers)
+
+    # ===== 写入 =====
+
     async def add(self, trigger: str, response: str, scope: str,
-                  max_per_scope: int = DEFAULT_MAX_COMMANDS_PER_SCOPE) -> Optional[str]:
+                  max_per_scope: int = DEFAULT_MAX_COMMANDS_PER_SCOPE,
+                  precondition: Optional[Callable[[], bool]] = None) -> Optional[str]:
         """添加命令到指定作用域（带并发锁和数量上限）。
 
         覆盖已有触发词时，若旧回复内容替换后已无任何命令引用，会作为「孤儿」返回，
         供调用方按需清理（典型为带图添加自动落盘的图片文件）。
 
+        ``precondition`` 在写锁内、改内存前求值（同步、须快速），返回 False 即放弃本次提交并抛
+        ``StaleResourceError``；用于把「图片落盘目录与当前配置一致」这类外部条件纳入事务。
+
         Returns:
             Optional[str]: 因本次覆盖而失去全部引用的旧回复内容；无需清理时返回 None。
 
         Raises:
-            ValueError: 当作用域命令数达到上限时抛出。
+            CommandQuotaError: 当作用域命令数达到上限时抛出。
+            DataProtectionError: 保护模式 / 已退役 / 代际过期。
+            StaleResourceError: 前置条件不成立。
+            OSError: 保存失败（含 DataSaveError），内存已回滚。
         """
         async with self._lock:
-            self._ensure_writable()
+            self.ensure_writable()
+            if precondition is not None and not precondition():
+                raise StaleResourceError("图片目录刚被修改，本次添加未提交，请重新发送")
             scope_created = scope not in self.commands
             if scope_created:
                 self.commands[scope] = {}
@@ -236,7 +389,7 @@ class CommandDataManager:
             ):
                 if scope_created:
                     del self.commands[scope]  # 回滚本次为校验而新建的空作用域
-                raise ValueError(
+                raise CommandQuotaError(
                     f"作用域 '{scope}' 已达到最大命令数 {max_per_scope}"
                 )
             old_value = self.commands[scope].get(trigger)
@@ -267,7 +420,7 @@ class CommandDataManager:
             第二项供调用方清理孤儿资源；仍被其他命令引用或未删除时为 None。
         """
         async with self._lock:
-            self._ensure_writable()
+            self.ensure_writable()
             if scope in self.commands and trigger in self.commands[scope]:
                 old_value = self.commands[scope][trigger]
                 del self.commands[scope][trigger]
@@ -293,7 +446,7 @@ class CommandDataManager:
             Tuple[bool, Optional[str]]: ``(是否真的删除, 删除后失去全部引用的旧回复内容)``。
         """
         async with self._lock:
-            self._ensure_writable()
+            self.ensure_writable()
             if "global" in self.commands and trigger in self.commands["global"]:
                 old_value = self.commands["global"][trigger]
                 del self.commands["global"][trigger]
@@ -313,39 +466,57 @@ class CommandDataManager:
         用于删除/覆盖命令后判断旧回复内容（典型为带图添加落盘的图片文件名）是否已成孤儿。
         必须在 ``_lock`` 持有期间、且记录变更完成后调用，确保与并发写操作看到一致快照。
         同一张图片经 hash 去重可被多个触发词共享，因此只有计数归零才算孤儿。
+        比较经 ``_value_key`` 规范化（纯字符串运算，不碰文件系统）：``cc_x.png`` 与
+        ``./cc_x.png`` 视为同一引用。非图片类回复的键即自身，此时只做等值比较、不逐条求键。
         """
+        target_key = self._value_key(value)
+        compare_keys = target_key != value
         for bucket in self.commands.values():
             for response in bucket.values():
                 if response == value:
                     return True
+                if compare_keys and self._value_key(response) == target_key:
+                    return True
         return False
 
-    async def cleanup_if_unreferenced(self, value: str, deleter: Callable[[], None]) -> bool:
+    async def cleanup_if_unreferenced(
+        self,
+        value: str,
+        deleter: Callable[[], Optional[bool]],
+        *,
+        additional_reference_check: Optional[Callable[[Tuple[str, ...]], Awaitable[bool]]] = None,
+    ) -> bool:
         """锁内原子地判断 ``value`` 是否已成孤儿，若是则调用 ``deleter`` 删除，返回是否执行了删除。
 
         把"引用计数判断 + 资源删除"合并进同一把写锁，消除 ``_is_referenced`` 判断与外部删除之间的
         TOCTOU 窗口——典型场景：两人并发添加同一张图（同 hash → 同文件名）、其中一个因作用域
         超限失败，若"判断未引用"与"删除文件"之间被另一方写入引用，旧实现会误删对方刚引用的图。
-        ``deleter`` 须为快速的同步删除（如 ``os.unlink``，自行吞掉 missing/IO 异常），在锁内执行。
+        ``deleter`` 须为快速的同步删除，在锁内执行；返回 False 表示安全条件变化，未执行删除。
+        ``additional_reference_check`` 可对去重后的回复快照做异步文件身份复核。等待时仍持数据锁，
+        防止新增引用；等待后重新检查代际，避免旧代的复核结果被用于删除新代资源。
+
+        退役 / 代际过期 / 保护模式下**不删**：此时本实例的引用快照可能已经过期（新实例或新代际
+        可能刚引用了同一文件），按过期快照删除会误删共享磁盘上仍在使用的图片。宁可留一个可
+        事后回收的孤儿文件。
         """
         async with self._lock:
+            reason = self._writable_reason()
+            if reason is not None:
+                logger.info("跳过孤儿清理 %r（%s），文件留待后续回收", value, reason)
+                return False
             if self._is_referenced(value):
                 return False
-            deleter()
-            return True
-
-    def has_global(self, trigger: str) -> bool:
-        """global 作用域是否存在某个 trigger（提示消息用，避免外部窥探 commands dict）。"""
-        return "global" in self.commands and trigger in self.commands["global"]
-
-    def get_triggers_for_scope(self, scope: str) -> List[str]:
-        """获取指定作用域下可见的所有触发词（本域独有 + global 共享），已排序。"""
-        triggers: set[str] = set()
-        if "global" in self.commands:
-            triggers.update(self.commands["global"].keys())
-        if scope in self.commands:
-            triggers.update(self.commands[scope].keys())
-        return sorted(triggers)
+            if additional_reference_check is not None:
+                responses = tuple(dict.fromkeys(
+                    response for commands in self.commands.values() for response in commands.values()
+                ))
+                if await additional_reference_check(responses):
+                    return False
+                reason = self._writable_reason()
+                if reason is not None:
+                    logger.info("文件身份复核后放弃清理 %r（%s）", value, reason)
+                    return False
+            return deleter() is not False
 
     def purge_reserved_triggers(self, is_reserved: Callable[[str], bool]) -> int:
         """清除所有作用域中命中保留词的"幽灵"trigger，返回清除条数（仅改内存，不落盘）。
