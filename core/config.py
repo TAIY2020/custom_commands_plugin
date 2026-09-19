@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, List
 
 from maibot_sdk import Field, PluginConfigBase
-from pydantic import model_validator
+from pydantic import field_validator, model_validator
 
 from .common import (
     DEFAULT_MAX_COMMANDS_PER_SCOPE,
@@ -128,6 +128,39 @@ class SettingsSection(PluginConfigBase):
         实现委托给 ``ScopeResolver.migrate_legacy``，与运行时解析共享同一份逻辑。
         """
         return ScopeResolver.migrate_legacy(data)
+
+    @field_validator("admin_user_ids", mode="before")
+    @classmethod
+    def _coerce_admin_user_ids(cls, value: Any) -> Any:
+        """容忍 TOML 里把 QQ 号写成整数的常见写法。
+
+        pydantic v2 不会把 int 强转为 str，`admin_user_ids = [2550512468]` 会直接校验失败，
+        而 Runner 首次加载不吞该异常、整个插件激活失败。这里只放行「非空字符串」与
+        「非 bool 的正整数」，其余类型（bool/float/None/嵌套）仍抛错，避免把异常配置
+        静默转成看似有效的管理员标识（Python 里 True 是 int 子类，str(True) 会得到 "True"）。
+        """
+        if value is None:
+            return []
+        if isinstance(value, (str, int)) and not isinstance(value, bool):
+            value = [value]
+        if not isinstance(value, (list, tuple)):
+            return value  # 交给 pydantic 按 List[str] 报错
+        normalized: List[str] = []
+        for index, item in enumerate(value):
+            if isinstance(item, bool):
+                raise ValueError(f"admin_user_ids[{index}] 不能是布尔值: {item!r}")
+            if isinstance(item, int):
+                if item <= 0:
+                    raise ValueError(f"admin_user_ids[{index}] 必须是正整数 QQ 号: {item!r}")
+                normalized.append(str(item))
+                continue
+            if isinstance(item, str):
+                stripped = item.strip()
+                if stripped:
+                    normalized.append(stripped)
+                continue
+            raise ValueError(f"admin_user_ids[{index}] 必须是 QQ 号字符串或整数: {item!r}")
+        return normalized
 
 
 class CustomCommandsConfig(PluginConfigBase):
