@@ -16,23 +16,34 @@
      且**只执行与自身组件一致的命令**——正文不是本组件对应的命令一律放行，不越权借用。
 - 动态触发（用户 add 的 .xxx）走同一个 @HookHandler：命中已注册 trigger 才回复 + abort；
   未命中直接放行，避免抢占其他插件的 Command。
+- 权限统一交给 Host：添加/删除/删全局声明为受保护命令（``permission="operator"``），由 Host 命令链
+  按「命令管理」配置鉴权；带图添加与动态触发不经命令链，由 ``core.host_policy`` 读取同一份 Host
+  配置复刻判定。插件自带的 ``admin_user_ids`` 已弃用，仅在启动时提示迁移。
 
 [模块拓扑]
-本文件为薄入口：装配协作模块 + 生命周期 + get_components 前缀重写 + 5 个装饰器入口
-（@Command×4 / @HookHandler×1，body 委托）。@Command/@HookHandler 必须定义在插件类上
-才会被 collect_components 收集，故入口留此、业务下沉。具体能力拆在 ``core`` 子包：
+本文件为薄入口：装配协作模块 + 生命周期 + get_components 前缀重写 + 配置页运行时状态 +
+5 个装饰器入口（@Command×4 / @HookHandler×1，body 委托）。@Command/@HookHandler 必须定义在
+插件类上才会被 collect_components 收集，故入口留此、业务下沉。具体能力拆在 ``core`` 子包：
 
 * ``core.common``      —— 常量 / 命令关键字与 pattern / 保留词判断 / 消息段解析 / 路由上下文
 * ``core.config``      —— 强类型配置 Schema（PluginSection / SettingsSection）
 * ``core.scope``       —— ScopeResolver：群组作用域解析（纯，可复用）
 * ``core.storage``     —— CommandDataManager：命令数据 CRUD + 原子落盘 + 孤儿判定 + 退役（纯）
 * ``core.images``      —— ImageStore：图片安全存取、规范化文件身份、孤儿回收、图片回复投递
-* ``core.forward``     —— ListForwardSender：命令列表的合并转发（多适配器路由 + 纯文本降级）
+* ``core.forward``     —— ListForwardSender：命令列表的合并转发（ctx.send.forward + 纯文本降级）
+* ``core.host_policy`` —— HostPolicy：Host 命令启停 / 使用范围 / 受保护命令权限的插件侧镜像
 * ``core.service``     —— CommandService：增删查与动态应答的统一编排（写命令唯一入口）
 * ``core.dispatcher``  —— DynamicDispatcher：入站消息的动态命令路由（带图添加 / 命中应答 / 后台任务）
 """
 
-from maibot_sdk import Command, HookHandler, MaiBotPlugin
+from maibot_sdk import (
+    ON_BOT_CONFIG_RELOAD,
+    Command,
+    ConfigWidget,
+    ConfigWidgetState,
+    HookHandler,
+    MaiBotPlugin,
+)
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 import asyncio
@@ -50,8 +61,13 @@ from .core.common import (
     BUILTIN_PATTERN_DELETE,
     BUILTIN_PATTERN_DELETE_GLOBAL,
     BUILTIN_PATTERN_LIST,
+    COMMAND_NAME_ADD,
+    COMMAND_NAME_DELETE,
+    COMMAND_NAME_DELETE_GLOBAL,
+    COMMAND_NAME_LIST,
     PLUGIN_VERSION,
     PREFIX_PLACEHOLDER,
+    PROTECTED_COMMAND_NAMES,
     build_message_route,
     compile_builtin_patterns,
     extract_text_and_images,
@@ -60,6 +76,7 @@ from .core.common import (
 from .core.config import CustomCommandsConfig
 from .core.dispatcher import DynamicDispatcher
 from .core.forward import ListForwardSender
+from .core.host_policy import HostPolicy
 from .core.images import ImageStore
 from .core.scope import ScopeResolver
 from .core.service import CommandService
@@ -72,6 +89,8 @@ _UNLOAD_DRAIN_TIMEOUT_SECONDS = 10.0
 # 旧图片目录迁移完成标记（持久数据目录下）。以标记而非「目标目录是否存在」判断是否已迁移：
 # 目标目录会被 on_load 的 mkdir 或后续新增图片提前创建，不能作为迁移完成的证据。
 _LEGACY_IMAGES_MARKER = ".legacy_images_migrated.json"
+# 配置页「命令统计」最多列出的作用域数（按命令数降序），避免作用域很多时状态文本过长。
+_WIDGET_MAX_LISTED_SCOPES = 8
 
 
 # --- 主插件类 ---
@@ -85,6 +104,17 @@ class CustomCommandsPlugin(MaiBotPlugin):
     """
 
     config_model = CustomCommandsConfig
+    # 订阅主程序 bot 配置广播：「命令管理」中的管理员、按命令放行、停用与使用范围都在其中，
+    # 热重载后立即刷新 HostPolicy 快照，hook 旁路路径与 Host 命令链保持同一口径。
+    config_reload_subscriptions = (ON_BOT_CONFIG_RELOAD,)
+    # 配置页运行时状态（只读，不写入 config.toml），见 get_config_widget_state。
+    config_widgets = [
+        ConfigWidget(id="permission", kind="status", label="管理权限"),
+        ConfigWidget(id="commands", kind="status", label="命令统计"),
+        ConfigWidget(id="data", kind="status", label="数据状态"),
+        ConfigWidget(id="tasks", kind="status", label="后台任务"),
+        ConfigWidget(id="images", kind="status", label="图片目录"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -94,7 +124,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         # 生命周期状态
         self._plugin_dir: str = ""
         self._data_dir: str = ""  # 持久数据目录（ctx.paths.data_dir），命令 JSON 与托管图片的存放基准
-        self._admin_set: set[str] = set()  # 缓存管理员集合
+        self._warned_deprecated_admins: Tuple[str, ...] = ()  # 已提示过迁移的弃用管理员列表，避免重复刷屏
         self._registered_prefix: Optional[str] = None  # 注册到主程序时使用的 prefix，用于检测热改
         self._self_reload_scheduled: bool = False  # 标记是否已调度自重载任务，防重入
         # 持有自重载 task 的强引用：asyncio.create_task 返回的 task 若无人引用，
@@ -105,11 +135,12 @@ class CustomCommandsPlugin(MaiBotPlugin):
         self._builtin_patterns: Dict[str, "re.Pattern[str]"] = {}
         self._builtin_patterns_prefix: str = ""
         # 4 个持 plugin 弱引用的协作模块；构造仅存 self 引用，相互依赖在调用时延迟解析，
-        # 故构造顺序无关（service 用 images/forward/scope/storage，dispatcher 用 service）。
+        # 故构造顺序无关（service 用 images/forward/scope/storage，dispatcher 用 service/host_policy）。
         self._images = ImageStore(self)
         self._forward = ListForwardSender(self)
         self._service = CommandService(self)
         self._dispatcher = DynamicDispatcher(self)
+        self._host_policy = HostPolicy(self)
         # 图片回复的引用比较键：让 "cc_x.png" 与 "./cc_x.png" 算同一引用，避免误清孤儿。
         self._data_manager.set_value_normalizer(self._images.reference_key)
 
@@ -331,9 +362,9 @@ class CustomCommandsPlugin(MaiBotPlugin):
             enable_isolation=self.config.settings.enable_group_isolation,
         )
 
-        # 缓存管理员集合与内置命令正则
-        self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
+        # 缓存内置命令正则，提示弃用的插件管理员配置
         self._refresh_builtin_patterns()
+        self._warn_deprecated_admins()
 
         # 旧图片目录迁移（以标记判断完成，逐文件补齐），然后确保图片目录存在
         await asyncio.to_thread(self._migrate_legacy_images_sync)
@@ -341,6 +372,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
             await asyncio.to_thread(lambda: self._images.resolve_dir().mkdir(parents=True, exist_ok=True))
         except OSError as e:
             logger.warning("创建图片目录失败: %s，图片功能可能不可用", e)
+
+        # 预热 Host 命令权限快照（带图添加每次仍会重新读取，这里失败不影响加载）
+        if await self._host_policy.refresh() is None:
+            logger.warning("启动时未能读取主程序命令权限配置；带图添加与配置页状态将在之后重试读取")
 
         logger.info("自定义命令插件(v%s)初始化完成（代际 %d）。", PLUGIN_VERSION, generation)
 
@@ -366,11 +401,18 @@ class CustomCommandsPlugin(MaiBotPlugin):
         logger.info("自定义命令插件已卸载。")
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
-        """配置热重载回调。config_model 会自动更新 self.config。"""
+        """配置热重载回调。
+
+        ``self``：插件自身配置，config_model 会自动更新 self.config。
+        ``bot``：主程序全局配置广播（已订阅），用其中的 plugin 节刷新 Host 命令权限快照。
+        """
+        if scope == ON_BOT_CONFIG_RELOAD:
+            self._host_policy.apply_broadcast(config_data)
+            return
         if scope == "self":
-            # 刷新管理员缓存与内置命令正则
-            self._admin_set = {str(uid) for uid in self.config.settings.admin_user_ids}
+            # 刷新内置命令正则，提示弃用的插件管理员配置
             self._refresh_builtin_patterns()
+            self._warn_deprecated_admins()
             # 刷新作用域解析器
             self._scope_resolver.refresh(
                 group_scopes=self.config.settings.group_scopes,
@@ -452,13 +494,108 @@ class CustomCommandsPlugin(MaiBotPlugin):
             if not success:
                 self._self_reload_scheduled = False
 
-    def _check_admin(self, user_id: str) -> bool:
-        """检查用户是否有管理员权限（使用缓存集合）。
+    def _warn_deprecated_admins(self) -> None:
+        """``admin_user_ids`` 已弃用：仍有填写时提示迁移到 Host 命令权限（同一份列表只提示一次）。"""
+        try:
+            admins = tuple(str(uid) for uid in self.config.settings.admin_user_ids)
+        except Exception:
+            return
+        if not admins or admins == self._warned_deprecated_admins:
+            return
+        self._warned_deprecated_admins = admins
+        logger.warning(
+            "配置项 admin_user_ids 已弃用且不再生效（当前填有 %d 个）。增删命令改由主程序命令权限控制，"
+            "请到 WebUI「麦麦主程序配置 → 命令管理」把以下用户加入「全局管理员」或按命令放行：%s",
+            len(admins), ", ".join(f"qq:{uid}" for uid in admins),
+        )
 
-        缓存集合 ``_admin_set`` 随 on_load / on_config_update 刷新，是插件生命周期状态，
-        故留在入口类；CommandService 经 ``self._plugin._check_admin`` 调用。
-        """
-        return str(user_id) in self._admin_set
+    # ===== 配置页运行时状态 =====
+
+    async def get_config_widget_state(self) -> Dict[str, ConfigWidgetState]:
+        """配置页运行时状态：只读内存快照，不做 I/O、不发 RPC（配置页约每 2 秒读取一次）。"""
+        return {
+            "permission": self._permission_widget_state(),
+            "commands": self._commands_widget_state(),
+            "data": self._data_widget_state(),
+            "tasks": self._tasks_widget_state(),
+            "images": self._images_widget_state(),
+        }
+
+    def _permission_widget_state(self) -> ConfigWidgetState:
+        try:
+            deprecated_count = len(self.config.settings.admin_user_ids)
+        except Exception:
+            deprecated_count = 0
+        deprecated_note = (
+            f"\n插件配置 admin_user_ids 已弃用（仍填有 {deprecated_count} 个，不再生效），请迁移到主程序「命令管理」"
+            if deprecated_count else ""
+        )
+        snapshot = self._host_policy.snapshot
+        if snapshot is None:
+            return ConfigWidgetState(
+                text="尚未读取到主程序命令权限配置，将在下次带图添加或主程序配置热重载时重试" + deprecated_note,
+                tone="warning",
+            )
+        try:
+            plugin_id = self.ctx.plugin_id
+        except Exception:
+            plugin_id = ""
+        extra = snapshot.command_allow_user_count(f"{plugin_id}.{name}" for name in PROTECTED_COMMAND_NAMES)
+        parts = [f"主程序全局管理员 {len(snapshot.operators)} 个", f"增删命令按命令放行 {extra} 个用户/聊天"]
+        if plugin_id in snapshot.usage_rules:
+            parts.append("已启用插件使用范围限制")
+        if not snapshot.operators and not extra:
+            return ConfigWidgetState(
+                text="未配置任何管理员：除本地控制台外无人可以添加/删除命令，"
+                     "请在主程序「命令管理」中配置全局管理员或按命令放行" + deprecated_note,
+                tone="warning",
+            )
+        return ConfigWidgetState(text="；".join(parts) + deprecated_note, tone="warning" if deprecated_count else "success")
+
+    def _commands_widget_state(self) -> ConfigWidgetState:
+        try:
+            # load_async 在线程池里替换整库，极少数情况下与这里的遍历交错，按「统计中」处理即可。
+            counts = sorted(
+                ((scope, len(bucket)) for scope, bucket in list(self._data_manager.commands.items())),
+                key=lambda item: (-item[1], item[0]),
+            )
+        except RuntimeError:
+            return ConfigWidgetState(text="命令数据加载中，稍后刷新")
+        total = sum(count for _, count in counts)
+        listed = "、".join(f"{scope} {count} 条" for scope, count in counts[:_WIDGET_MAX_LISTED_SCOPES])
+        if len(counts) > _WIDGET_MAX_LISTED_SCOPES:
+            listed += f" 等 {len(counts)} 个作用域"
+        return ConfigWidgetState(text=f"共 {total} 条命令" + (f"：{listed}" if listed else ""))
+
+    def _data_widget_state(self) -> ConfigWidgetState:
+        manager = self._data_manager
+        if manager.file_path is None:
+            return ConfigWidgetState(text="命令数据尚未加载")
+        if manager.is_protected:
+            return ConfigWidgetState(
+                text=f"保护模式：{manager.file_path.name} 加载失败或迁移未完成，所有修改都会被拒绝；"
+                     "请修复数据文件后重载插件",
+                tone="error",
+            )
+        if manager.is_retired:
+            return ConfigWidgetState(text="插件正在重载或卸载，修改暂不可用", tone="warning")
+        return ConfigWidgetState(text=f"正常：{manager.file_path}", tone="success")
+
+    def _tasks_widget_state(self) -> ConfigWidgetState:
+        executor = self._dispatcher.background
+        text = (
+            f"运行中 {executor.running}/{executor.max_concurrent}，"
+            f"排队 {executor.queued}/{executor.max_queued}"
+        )
+        if executor.closed:
+            return ConfigWidgetState(text=text + "（已停止接收新任务）", tone="warning")
+        return ConfigWidgetState(text=text, tone="warning" if executor.queued else "neutral")
+
+    def _images_widget_state(self) -> ConfigWidgetState:
+        try:
+            return ConfigWidgetState(text=str(self._images.resolve_dir()))
+        except Exception as exc:
+            return ConfigWidgetState(text=f"无法解析图片目录：{exc}", tone="error")
 
     # ===== 内置命令：纯文本段重新匹配 =====
 
@@ -492,9 +629,9 @@ class CustomCommandsPlugin(MaiBotPlugin):
         Host 传入的 matched_groups 来自 processed_plain_text，会被引用消息原文和 @昵称污染
         （见类 docstring）。这里只信任 text 段拼出的正文：
         - 正文恰是 ``kind`` 对应的内置命令 → 用重新匹配得到的捕获组执行。
-        - 正文是另一种内置命令 → 不越权执行：Host 只对它命中的那个组件做了启停/聊天级禁用检查，
-          借本入口执行别的组件会绕过这些约束（正常情况下 hook 已改写匹配文本，Host 会直接命中
-          正确组件，走不到这里）。
+        - 正文是另一种内置命令 → 不越权执行：Host 只对它命中的那个组件做了启停、聊天级禁用与
+          命令权限检查（例如命中公开的列表命令时不会检查添加命令的权限），借本入口执行别的组件
+          会绕过这些约束（正常情况下 hook 已改写匹配文本，Host 会直接命中正确组件，走不到这里）。
         - 正文不是内置命令（例如只是 ``.天气``，或消息没有 text 段）→ 放行。
         放行时返回不拦截，Host 按 continue_process=True 继续主链，等同从未命中命令。
         """
@@ -526,11 +663,14 @@ class CustomCommandsPlugin(MaiBotPlugin):
             return await self._service.build_list(stream_id, group_id, user_id, route=route)
 
     # ===== 装饰器入口（body 委托协作模块）=====
+    # 添加/删除/删全局声明为 Host 受保护命令：Host 命令链在调用 handler 前按「命令管理」中的
+    # 全局管理员与按命令放行规则鉴权，无权限时由 Host 回执并拦截，handler 不会被调用。
 
     @Command(
-        "custom_command_add",
+        COMMAND_NAME_ADD,
         description="添加自定义命令。格式：<前缀>问：触发词答：回复内容",
         pattern=BUILTIN_PATTERN_ADD,
+        permission="operator",
     )
     async def handle_add(self, stream_id: str = "", group_id: str = "",
                          user_id: str = "", message: Optional[dict] = None, **kwargs):
@@ -538,9 +678,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
         return await self._dispatch_builtin("add", message, stream_id, group_id, user_id)
 
     @Command(
-        "custom_command_delete",
+        COMMAND_NAME_DELETE,
         description="删除自定义命令。格式：<前缀>删：触发词",
         pattern=BUILTIN_PATTERN_DELETE,
+        permission="operator",
     )
     async def handle_delete(self, stream_id: str = "", group_id: str = "",
                             user_id: str = "", message: Optional[dict] = None, **kwargs):
@@ -548,9 +689,10 @@ class CustomCommandsPlugin(MaiBotPlugin):
         return await self._dispatch_builtin("delete", message, stream_id, group_id, user_id)
 
     @Command(
-        "custom_command_delete_global",
+        COMMAND_NAME_DELETE_GLOBAL,
         description="删除全局自定义命令。格式：<前缀>删全局：触发词",
         pattern=BUILTIN_PATTERN_DELETE_GLOBAL,
+        permission="operator",
     )
     async def handle_delete_global(self, stream_id: str = "", group_id: str = "",
                                    user_id: str = "", message: Optional[dict] = None, **kwargs):
@@ -558,7 +700,7 @@ class CustomCommandsPlugin(MaiBotPlugin):
         return await self._dispatch_builtin("delete_global", message, stream_id, group_id, user_id)
 
     @Command(
-        "custom_command_list",
+        COMMAND_NAME_LIST,
         description="列出所有可用的自定义命令。格式：<前缀>列表",
         pattern=BUILTIN_PATTERN_LIST,
     )
