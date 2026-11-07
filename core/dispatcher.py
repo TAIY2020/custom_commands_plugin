@@ -16,7 +16,7 @@ Hook 路径按 order 顺次执行，未 abort 就放行，彻底绕过 first-mat
 内置命令正文修正：Host 用 processed_plain_text 跑 @Command 正则，正文是内置命令但被引用/@/
 首尾空白污染时 Host 会失配或命中错误的命令。本 hook 允许改参（chat.receive.after_process 允许
 modified_kwargs），此时把 message.processed_plain_text 改写为纯正文后 continue，Host 随即按
-干净正文匹配到正确组件，组件启停、聊天级禁用、命令前后 hook 全部由 Host 正常流程处理。
+干净正文匹配到正确组件，组件启停、聊天级禁用、命令权限、命令前后 hook 全部由 Host 正常流程处理。
 
 耗时与超时：Host 对 blocking hook 有超时（本插件声明 20s），超时后按 ErrorPolicy.SKIP 放行、
 消息继续落入 LLM，而 Runner 内的 handler 协程不会被取消——大图发送慢时会出现「图发出去了、
@@ -24,6 +24,11 @@ LLM 又回了一条」。因此本层在**确认命中后立即返回 abort**，
 （有界：并发上限 + 排队上限）；执行器拒收（满载 / 卸载中）时**不**在 hook 内同步执行，而是仍
 abort 并发一条带超时的短回执，日志可追踪。后台任务在协程体内绑定提交时捕获的代际，
 写入与清理由数据层按代际校验。
+
+Host 门禁：本层的两条路径都不经过 Host 命令链，由 ``HostPolicy`` 复刻同口径判定——
+带图添加等同执行 ``custom_command_add``：命令管理停用即放行（与 Host 把停用命令当普通消息一致），
+插件使用范围或受保护命令权限不满足即拦截并按 Host 文案回执（尊重「不显示无权限提示」）；
+动态触发是公开功能，只受插件使用范围约束，不满足时放行给后续主链，与「未注册」同等对待。
 """
 
 from __future__ import annotations
@@ -36,6 +41,7 @@ from collections import deque
 from typing import TYPE_CHECKING, Any, Callable, Coroutine, Deque, Dict, List, Optional, Set, Tuple
 
 from .common import (
+    COMMAND_NAME_ADD,
     KW_ADD,
     KW_ADD_ANSWER,
     MessageRoute,
@@ -43,6 +49,7 @@ from .common import (
     extract_text_and_images,
     is_reserved_trigger,
 )
+from .host_policy import sender_identity_from_message
 
 if TYPE_CHECKING:
     from ..plugin import CustomCommandsPlugin
@@ -57,10 +64,15 @@ _DELIVER_TIMEOUT_SECONDS = 60.0
 # 带图添加（写数据）不取消：取消等待协程不会终止已在线程池里的文件写入，只会破坏事务收尾；
 # 超过此时限仅记 warning 供排查。
 _IMAGE_ADD_SLOW_WARN_SECONDS = 60.0
+# 动态触发校验插件使用范围时可接受的权限快照有效期（秒）。Host 热重载会经 bot 配置广播即时
+# 刷新快照，这里只是广播丢失时的兜底；带图添加属写操作，每次都读取最新配置。
+_POLICY_MAX_AGE_SECONDS = 60.0
 
 _BUSY_TEXT = "⏳ 当前处理繁忙，请稍后再试"
 _RELOADING_TEXT = "⏳ 插件正在重载，请稍后再试"
-_ADD_STATUS_UNAVAILABLE_TEXT = "暂时无法确认添加命令的启用状态，请稍后重试"
+_ADD_STATUS_UNAVAILABLE_TEXT = "暂时无法确认添加命令的启用状态或权限，请稍后重试"
+# 与 Host 命令链的无权限回执保持一致（bot.py::_process_commands）。
+_PERMISSION_DENIED_TEXT = "你没有权限使用此命令。"
 
 CoroFactory = Callable[[], Coroutine[Any, Any, Any]]
 
@@ -92,6 +104,14 @@ class BackgroundExecutor:
     @property
     def queued(self) -> int:
         return len(self._queue)
+
+    @property
+    def max_concurrent(self) -> int:
+        return self._max_concurrent
+
+    @property
+    def max_queued(self) -> int:
+        return self._max_queued
 
     def submit(self, factory: CoroFactory, *, name: str) -> Optional[str]:
         """提交工作；接受返回 None，拒绝返回原因（``closed`` / ``full``）。"""
@@ -226,7 +246,8 @@ class DynamicDispatcher:
         - ``{"action": "continue", "modified_kwargs": {...}}``：正文是内置命令但 Host 的
           processed_plain_text 被引用/@/空白污染，改写后交由 Host 正常匹配。
         - ``None``：放行。任何"不该由本插件处理"的消息（非群/私聊文本、不带前缀、
-          未注册 trigger、正文为空、添加命令组件已被禁用的带图添加）都返回 None。
+          未注册 trigger、正文为空、不在插件使用范围内的动态触发、添加命令已被禁用或停用的
+          带图添加）都返回 None。
 
         ``hook_kwargs`` 为 handler 收到的除 message 外的其它 hook 参数，改参时原样带回，
         因为 Host 会用 modified_kwargs **整体替换**后续处理器与主链看到的 kwargs。
@@ -282,12 +303,24 @@ class DynamicDispatcher:
         response_value = p._service.lookup(trigger, route.group_id, route.user_id)
         if response_value is None:
             return None
+        if not await self._usage_allowed(message):
+            logger.info("动态命令 '%s' 的发送者不在插件使用范围内，已放行给后续主链", trigger)
+            return None
 
         await self._submit_or_notify(
             lambda: self._deliver_in_background(generation, trigger, response_value, route),
             name=f"custom_commands.deliver:{trigger}", stream_id=route.stream_id, generation=generation,
         )
         return {"action": "abort"}
+
+    async def _usage_allowed(self, message: Dict[str, Any]) -> bool:
+        """动态触发的插件使用范围校验；Host 权限配置读不到时放行（与无限制的旧行为一致）。"""
+        policy_cache = self._plugin._host_policy
+        policy = await policy_cache.get(max_age=_POLICY_MAX_AGE_SECONDS) or policy_cache.snapshot
+        if policy is None:
+            logger.warning("无法获取 Host 权限配置，本次动态触发不校验插件使用范围")
+            return True
+        return policy.can_use_plugin(self._plugin.ctx.plugin_id, sender_identity_from_message(message))
 
     def _rewrite_for_builtin(
         self, message: Dict[str, Any], base_text: str, hook_kwargs: Optional[Dict[str, Any]],
@@ -342,11 +375,12 @@ class DynamicDispatcher:
 
         返回值语义：
         - ``None``                —— 不是带图添加场景（无图 / 文本不符合添加格式），或
-                                     ``custom_command_add`` 组件已被全局禁用（与 Host 对禁用
-                                     Command 的处理一致：不命中、交给后续主链），调用方继续
-                                     走 reserved 判断与动态触发。
-        - ``{"action": "abort"}`` —— 已确认是带图添加：权限/格式校验、图片解码/落盘/绑定与
-                                     回执交给后台任务（拒收时发短回执），本方法立即拦截主链。
+                                     ``custom_command_add`` 已被组件开关禁用、或在 Host「命令管理」
+                                     中停用（与 Host 对停用命令的处理一致：不命中、交给后续主链），
+                                     调用方继续走 reserved 判断与动态触发。
+        - ``{"action": "abort"}`` —— 已确认是带图添加：无权限时按 Host 口径回执后拦截；否则格式校验、
+                                     图片解码/落盘/绑定与回执交给后台任务（拒收时发短回执），
+                                     本方法立即拦截主链。
         """
         if not image_segs:
             return None  # 没有图片 → 不是带图添加，放行
@@ -356,19 +390,32 @@ class DynamicDispatcher:
         if not match:
             return None  # 有图但文本不符合添加格式 → 放行（带图触发或普通图片消息）
 
-        enabled = await self._plugin._service.is_add_command_enabled()
+        # 组件开关与 Host 权限配置都每次实时读取，两次查询并发进行，各自有界且不抛异常。
+        enabled, policy = await asyncio.gather(
+            self._plugin._service.is_add_command_enabled(),
+            self._plugin._host_policy.get(max_age=0),
+        )
         route = build_message_route(message)
         data_manager = self._plugin._data_manager
         if generation != data_manager.generation or data_manager.is_retired:
             await self._plugin._service.notify_busy(route.stream_id, _RELOADING_TEXT)
             return {"action": "abort"}
-        if enabled is None:
+        if enabled is None or policy is None:
             # 状态未知不是明确禁用；必须拦截，避免带图正文又被 Host 当作文本添加执行。
             await self._plugin._service.notify_busy(route.stream_id, _ADD_STATUS_UNAVAILABLE_TEXT)
             return {"action": "abort"}
-        if not enabled:
-            logger.info("custom_command_add 组件已禁用，带图添加消息放行")
+        plugin_id = self._plugin.ctx.plugin_id
+        command_id = f"{plugin_id}.{COMMAND_NAME_ADD}"
+        if not enabled or policy.is_command_disabled(command_id):
+            logger.info("%s 已被禁用或在命令管理中停用，带图添加消息放行", COMMAND_NAME_ADD)
             return None
+
+        identity = sender_identity_from_message(message)
+        if not policy.can_use_plugin(plugin_id, identity) or not policy.has_command_permission(command_id, identity):
+            logger.info("用户 %s 无权执行带图添加（Host 插件使用范围 / 命令权限），已拦截", identity.scoped_user_id)
+            if not policy.silent_permission_denied:
+                await self._plugin._service.notify_busy(route.stream_id, _PERMISSION_DENIED_TEXT)
+            return {"action": "abort"}
 
         # —— 确认是"带图添加"，此后无论成败都回发消息并 abort ——
         if not route.stream_id:
@@ -395,19 +442,15 @@ class DynamicDispatcher:
         self, generation: int, route: MessageRoute, trigger: str, trailing_text: str,
         b64_data: str, url_hint: str, valid_count: int,
     ) -> None:
-        """带图添加的后台部分：建流兜底 → 权限/格式校验 → 解码落盘绑定 → 回执。写数据，不取消。"""
+        """带图添加的后台部分：建流兜底 → 格式校验 → 解码落盘绑定 → 回执。写数据，不取消。
+
+        权限已在 hook 内按 Host 口径校验（``_try_image_add``），这里不再重复。
+        """
         service = self._plugin._service
         started = time.monotonic()
         with self._plugin._data_manager.bind_generation(generation):
             try:
                 stream_id = await service.ensure_session(route)
-
-                # 先做与文本添加路径一致的管理员校验：无论「答：」后是否多填文字，非管理员都应先
-                # 收到统一的「无权限」提示，而不是先撞上格式约束（既与文本添加路径行为不一致，
-                # 又把内部格式细节暴露给无权限用户）。add_image 内仍会再校验一次权限，冗余但无害。
-                if not self._plugin._check_admin(route.user_id):
-                    await service._send_text("❌ 你没有权限执行此管理员命令", stream_id, context="无权限提示")
-                    return
 
                 if trailing_text:
                     await service._send_text(
@@ -417,7 +460,7 @@ class DynamicDispatcher:
                     )
                     return
 
-                # 权限 / 触发词 / 图片字节的全部校验与回执都在 service.add_image 内完成
+                # 触发词 / 图片字节的全部校验与回执都在 service.add_image 内完成
                 await service.add_image(
                     trigger, b64_data, url_hint, stream_id, route.group_id, route.user_id,
                     ignored_image_count=max(0, valid_count - 1),

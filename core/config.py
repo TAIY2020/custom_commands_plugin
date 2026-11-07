@@ -65,8 +65,15 @@ class SettingsSection(PluginConfigBase):
     )
     admin_user_ids: List[str] = Field(
         default_factory=list,
-        description="拥有添加/删除命令权限的用户 QQ 号列表",
-        json_schema_extra={"label": "管理员列表", "hint": "留空 [] 表示任何人都没有权限"},
+        description=(
+            "【已弃用，不再生效】旧版插件自带的管理员列表。增删命令（含带图添加）现在统一由 MaiBot "
+            "主程序的命令权限控制：请到 WebUI「麦麦主程序配置 → 命令管理」把管理员加入「全局管理员」，"
+            "或在添加/删除/删全局命令下按命令放行，格式 qq:QQ号。此处保留仅用于启动时提示迁移，可清空。"
+        ),
+        json_schema_extra={
+            "label": "管理员列表（已弃用）",
+            "hint": "不再生效：请在主程序「命令管理」中配置管理员，格式 qq:123456",
+        },
     )
     image_directory: str = Field(
         default="images",
@@ -132,7 +139,7 @@ class SettingsSection(PluginConfigBase):
     @field_validator("admin_user_ids", mode="before")
     @classmethod
     def _coerce_admin_user_ids(cls, value: Any) -> Any:
-        """容忍 TOML 里把 QQ 号写成整数的常见写法。
+        """容忍 TOML 里把 QQ 号写成整数的常见写法（字段已弃用，仍保留校验以免旧配置加载失败）。
 
         pydantic v2 不会把 int 强转为 str，`admin_user_ids = [2550512468]` 会直接校验失败，
         而 Runner 首次加载不吞该异常、整个插件激活失败。这里只放行「非空字符串」与

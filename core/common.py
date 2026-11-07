@@ -124,6 +124,14 @@ BUILTIN_PATTERN_DELETE = rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_DELETE)}(?P<trigg
 BUILTIN_PATTERN_DELETE_GLOBAL = rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_DELETE_GLOBAL)}(?P<trigger>.+)$"
 BUILTIN_PATTERN_LIST = rf"^{PREFIX_PLACEHOLDER}{re.escape(KW_LIST)}$"
 
+# 四个内置命令的组件名：@Command 声明、组件启停查询与 Host 命令 ID（``<plugin_id>.<组件名>``）共用。
+COMMAND_NAME_ADD = "custom_command_add"
+COMMAND_NAME_DELETE = "custom_command_delete"
+COMMAND_NAME_DELETE_GLOBAL = "custom_command_delete_global"
+COMMAND_NAME_LIST = "custom_command_list"
+# 声明为 Host 受保护命令（permission="operator"）的组件，配置页据此统计按命令放行的人数。
+PROTECTED_COMMAND_NAMES = (COMMAND_NAME_ADD, COMMAND_NAME_DELETE, COMMAND_NAME_DELETE_GLOBAL)
+
 # kind → 占位符 pattern。顺序即「纯文本重新匹配」的尝试顺序：delete_global 须先于 delete，
 # 虽然「删全局：」与「删：」并不互为前缀，但显式排序可防未来关键字调整后产生歧义。
 BUILTIN_PATTERNS: Dict[str, str] = {
@@ -175,19 +183,14 @@ def extract_text_and_images(raw_message: Any) -> Tuple[str, List[Dict[str, Any]]
 
 # --- 消息路由上下文 ---
 
-# 两个 QQ 适配器的插件 ID。它们把 API 都注册在 adapter.napcat.* 短名下，同时启用时短名调用
-# 会被 Host 判为「API 名称不唯一」，必须用 <plugin_id>.<短名> 全名调用。
-ADAPTER_PLUGIN_NAPCAT = "maibot-team.napcat-adapter"
-ADAPTER_PLUGIN_SNOWLUMA = "maibot-team.snowluma-adapter"
-
-# 与 Host platform_io/route_key_factory.py::RouteKeyFactory 的取键顺序保持一致。
+# 旧格式路由身份的候选键，与 Host platform_io/route_key_factory.py::RouteKeyFactory 保持一致。
 _ACCOUNT_ID_KEYS = ("platform_io_account_id", "account_id", "self_id", "bot_account")
 _SCOPE_KEYS = ("platform_io_scope", "route_scope", "adapter_scope", "connection_id")
 
 
 @dataclass(frozen=True)
 class MessageRoute:
-    """一条入站消息的路由上下文：发往哪个会话、经由哪个适配器/账号。"""
+    """一条入站消息的路由上下文：发往哪个会话、经由哪个账号/连接。"""
 
     stream_id: str = ""
     platform: str = "qq"
@@ -195,7 +198,6 @@ class MessageRoute:
     user_id: str = ""
     account_id: str = ""
     scope: str = ""
-    adapter_plugin_id: str = ""  # 识别不出来源适配器时为空，调用方退回短名
 
     @property
     def chat_type(self) -> str:
@@ -213,19 +215,22 @@ def _pick_string(mapping: Dict[str, Any], keys: Tuple[str, ...]) -> str:
     return ""
 
 
-def resolve_adapter_plugin_id(additional_config: Any) -> str:
-    """按 additional_config 的适配器专有字段判断消息来源。
+def extract_route_identity(message: Dict[str, Any]) -> Tuple[str, str]:
+    """取入站消息的路由身份 (account_id, scope)，口径与 Host ``RouteKeyFactory`` 一致。
 
-    SnowLuma 在 notice 上也会写 napcat_notice_* 兼容字段，故先判 snowluma_* 再判 napcat_*；
-    普通消息两家分别只写 snowluma_message_type / napcat_message_type。
+    消息顶层带 ``account_id`` 键即为正式格式（SnowLuma 等适配器把 bot 账号与连接 ID 写在顶层），
+    此时只认顶层的 account_id/scope，值为 None 时视为空；否则按旧格式对 account 与 scope 各自
+    依次从消息顶层、message_info、additional_config 中按候选键查找。只读 additional_config 会让
+    顶层写法的适配器拿到空身份。
     """
-    if not isinstance(additional_config, dict):
-        return ""
-    if "snowluma_message_type" in additional_config or "snowluma_notice_type" in additional_config:
-        return ADAPTER_PLUGIN_SNOWLUMA
-    if "napcat_message_type" in additional_config or "napcat_notice_type" in additional_config:
-        return ADAPTER_PLUGIN_NAPCAT
-    return ""
+    if "account_id" in message:
+        return str(message.get("account_id") or "").strip(), str(message.get("scope") or "").strip()
+    msg_info = message.get("message_info") if isinstance(message.get("message_info"), dict) else {}
+    additional = msg_info.get("additional_config") if isinstance(msg_info.get("additional_config"), dict) else {}
+    sources = (message, msg_info, additional)
+    account_id = next((value for value in (_pick_string(s, _ACCOUNT_ID_KEYS) for s in sources) if value), "")
+    scope = next((value for value in (_pick_string(s, _SCOPE_KEYS) for s in sources) if value), "")
+    return account_id, scope
 
 
 def build_message_route(
@@ -242,17 +247,14 @@ def build_message_route(
         msg_info = {}
     user_info = msg_info.get("user_info") or {}
     group_info = msg_info.get("group_info") or {}
-    additional = msg_info.get("additional_config") or {}
-    if not isinstance(additional, dict):
-        additional = {}
+    account_id, scope = extract_route_identity(msg)
     return MessageRoute(
         stream_id=str(stream_id or msg.get("session_id") or ""),
         platform=str(msg.get("platform") or "qq"),
         group_id=str(group_id or (group_info.get("group_id") if isinstance(group_info, dict) else "") or ""),
         user_id=str(user_id or (user_info.get("user_id") if isinstance(user_info, dict) else "") or ""),
-        account_id=_pick_string(additional, _ACCOUNT_ID_KEYS),
-        scope=_pick_string(additional, _SCOPE_KEYS),
-        adapter_plugin_id=resolve_adapter_plugin_id(additional),
+        account_id=account_id,
+        scope=scope,
     )
 
 

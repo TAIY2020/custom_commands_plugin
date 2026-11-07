@@ -2,8 +2,12 @@
 
 ``CommandService`` 执行式——持 plugin 弱引用，直接 ``ctx.send`` 发回执，返回
 ``(ok, log, intercept)`` 三元组供 @Command handler 透传。编排 scope/storage/images/forward
-四个能力模块；admin 校验与作用域解析在此统一，消除文本添加(add_text)与带图添加
-(add_image)两条写路径在编排层面的重复。
+四个能力模块；作用域解析在此统一，消除文本添加(add_text)与带图添加(add_image)两条写路径
+在编排层面的重复。
+
+权限：增删命令是 Host 的受保护命令（@Command ``permission="operator"``），由 Host 命令链在
+调用 handler 之前完成鉴权；带图添加走 hook 旁路，由 DynamicDispatcher 按 ``HostPolicy`` 复刻
+同口径鉴权后才进入 ``add_image``。本层不再做任何管理员判断（插件自带的 admin_user_ids 已弃用）。
 
 ⚠️ 三元组第三项是 Host 的 ``intercept_message_level``（不是"成本/优先级"，勿照字面误解）：
 Host 按 ``bool()`` 解释它——见主程序 ``chat/message_receive/bot.py``::
@@ -24,6 +28,7 @@ from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 from .common import (
     ADAPTER_IMAGE_FALLBACK_TEXTS,
+    COMMAND_NAME_ADD,
     MessageRoute,
     build_list_header_text,
     build_scope_desc,
@@ -45,7 +50,6 @@ _SESSION_MAP_TTL_SECONDS = 1800.0
 _BUSY_NOTICE_TIMEOUT_MS = 3000
 # 组件查询同时限制整个调用与底层 RPC 响应等待，不复用之前的启用状态。
 _ADD_ENABLED_QUERY_TIMEOUT_MS = 3000
-_ADD_COMMAND_COMPONENT = "custom_command_add"
 
 
 class CommandService:
@@ -59,7 +63,7 @@ class CommandService:
         self._session_map: Dict[str, Tuple[str, float]] = {}
 
     async def notify_busy(self, stream_id: str, text: str) -> None:
-        """有界的快速回执：执行器拒收或无法确认组件状态时告知用户，失败只记日志。
+        """有界的快速回执：执行器拒收、无法确认组件状态或权限被拒时告知用户，失败只记日志。
 
         在 blocking hook 内调用，故必须带发送超时，不能让 hook 等待一次可能卡住的发送。
         不经 ensure_session（冷会话下本条回执可能发不出去，属可接受的最坏情况）。
@@ -86,8 +90,9 @@ class CommandService:
         """``custom_command_add`` 组件当前是否全局启用（Host 组件管理开关）。
 
         带图添加走 hook 路径、不经 Host 的 Command 分发，不会被组件启停自动约束；这里主动
-        为每次请求查询全局状态，避免旧的启用缓存让禁用失效。会话级禁用与命令前置 Hook
-        不包含在此接口中，仍不由这次查询覆盖。查询失败、组件缺失或状态非法时返回 None，
+        为每次请求查询全局状态，避免旧的启用缓存让禁用失效。注意组件注册表的 ``enabled`` 不反映
+        Host「命令管理」页的停用（``plugin.disabled_commands``），后者由 ``HostPolicy`` 另行检查；
+        会话级禁用与命令前置 Hook 仍不由这次查询覆盖。查询失败、组件缺失或状态非法时返回 None，
         调用方应消费本次带图添加并提示重试，不能放行后又落入文本添加路径。
         """
         try:
@@ -111,7 +116,7 @@ class CommandService:
             for component in components:
                 if (
                     isinstance(component, dict)
-                    and component.get("name") == _ADD_COMMAND_COMPONENT
+                    and component.get("name") == COMMAND_NAME_ADD
                     and str(component.get("type") or "").upper() == "COMMAND"
                 ):
                     enabled = component.get("enabled")
@@ -201,10 +206,6 @@ class CommandService:
         # 能进入命令路径即说明含前缀的 pattern 已匹配，无需再校验前缀；matched_groups 异常时兜底。
         if not matched_groups:
             return False, "缺少匹配参数", 1
-
-        if not p._check_admin(user_id):
-            await self._send_text("❌ 你没有权限执行此管理员命令", stream_id, context="无权限提示")
-            return False, f"用户 {user_id} 无权限", 1
 
         trigger = matched_groups.get("trigger", "").strip()
         response = matched_groups.get("response", "").strip()
@@ -320,16 +321,13 @@ class CommandService:
                         ignored_image_count: int = 0) -> Tuple[bool, str, int]:
         """添加图片命令：把消息内图片落盘并绑定触发词。
 
-        ``trigger`` / ``b64_data`` / ``url_hint`` 由 DynamicDispatcher 从入站消息解析后传入。
+        ``trigger`` / ``b64_data`` / ``url_hint`` 由 DynamicDispatcher 从入站消息解析后传入，
+        调用方已完成与 Host 同口径的命令启停与权限校验。
         触发词校验与 add_text 同源（长度 + 保留词）；图片字节的解码/空判定/大小校验在此完成。
         触发词已存在时直接覆盖（与 add_text 语义一致）。``ignored_image_count`` 为同条消息中
         被忽略的额外图片数（仅取第一张），>0 时在成功回执里提示用户。
         """
         p = self._plugin
-        if not p._check_admin(user_id):
-            await self._send_text("❌ 你没有权限执行此管理员命令", stream_id, context="无权限提示")
-            return False, f"用户 {user_id} 无权限", 1
-
         if not trigger:
             await self._send_text("❌ 触发词不能为空", stream_id, context="触发词为空提示")
             return False, "触发词为空", 1
@@ -496,10 +494,6 @@ class CommandService:
         if not matched_groups:
             return False, "缺少匹配参数", 1
 
-        if not p._check_admin(user_id):
-            await self._send_text("❌ 你没有权限执行此管理员命令", stream_id, context="无权限提示")
-            return False, f"用户 {user_id} 无权限", 1
-
         trigger = matched_groups.get("trigger", "").strip()
         _, current_scope = self._resolve_scope(group_id, user_id)
         try:
@@ -542,10 +536,6 @@ class CommandService:
         if not matched_groups:
             return False, "缺少匹配参数", 1
 
-        if not p._check_admin(user_id):
-            await self._send_text("❌ 你没有权限执行此管理员命令", stream_id, context="无权限提示")
-            return False, f"用户 {user_id} 无权限", 1
-
         trigger = matched_groups.get("trigger", "").strip()
         try:
             success, orphan = await p._data_manager.delete_global(trigger)
@@ -581,7 +571,7 @@ class CommandService:
                          route: Optional[MessageRoute] = None) -> Tuple[bool, str, int]:
         """列出命令：<前缀>列表。优先合并转发，任何失败降级纯文本。
 
-        ``route`` 为入站消息的路由上下文，用于在多适配器共存时选定合并转发的提供者与账号。
+        ``route`` 为入站消息的路由上下文，用于判断平台与取 bot 账号作为转发节点发送者。
         """
         p = self._plugin
         scope_id, current_scope = self._resolve_scope(group_id, user_id)
@@ -599,23 +589,17 @@ class CommandService:
         header_text = build_list_header_text(scope_id, current_scope)
         # triggers 已在 get_triggers_for_scope 中排序
         list_content = "\n".join(f"▪️ {prefix}{trigger}" for trigger in triggers)
-        # 优先用 Napcat 合并转发；任何失败（目标 ID 非法、转发被风控、内部异常）
-        # 都降级为纯文本列表，保证用户至少能拿到命令清单。
+        # 优先用合并转发；任何失败（非 QQ 平台、转发被风控、内部异常）都降级为纯文本列表，
+        # 保证用户至少能拿到命令清单。
         forward_failure: Optional[str] = None
         try:
-            forward_failure = await p._forward.send_list(
-                header_text, list_content, group_id, user_id,
-                triggers=triggers, prefix=prefix, route=route,
-            )
-        except ValueError as exc:
-            logger.warning("发送命令列表时目标 ID 非法: %s", exc)
-            forward_failure = str(exc)
+            forward_failure = await p._forward.send_list(header_text, list_content, stream_id, route=route)
         except Exception as exc:
             logger.error("发送命令列表时发生异常: %s", exc, exc_info=True)
             forward_failure = "内部错误"
 
         if forward_failure:
-            # 来源未知/非 QQ 平台等路由决策也走这条降级，属正常路径，记 info 即可。
+            # 非 QQ 平台等路由决策也走这条降级，属正常路径，记 info 即可。
             logger.info("合并转发未使用(%s)，降级为纯文本列表", forward_failure)
             try:
                 text_ok = await p._forward.send_as_text(header_text, list_content, stream_id)
